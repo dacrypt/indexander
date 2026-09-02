@@ -46,6 +46,39 @@ fn authority(rank: f32, total_docs: usize) -> f32 {
     1.0 + AUTHORITY_WEIGHT * relative.max(0.0).ln_1p()
 }
 
+/// Corpus-wide term statistics, supplied from outside.
+///
+/// BM25 weights a term by how rare it is, and rarity is a property of the
+/// whole corpus. When an index is one shard of many, its local counts are the
+/// wrong ones: a term rare here and common elsewhere would be scored as rare,
+/// and the resulting scores could not be compared with another shard's.
+///
+/// Passing this in makes every shard score on one scale, which is the only
+/// thing that makes merging their results meaningful.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GlobalStats {
+    /// Documents across every shard.
+    pub total_docs: usize,
+    /// How many of those contain each term.
+    pub doc_freq: HashMap<String, usize>,
+}
+
+impl GlobalStats {
+    /// Sums one shard's contribution into the running totals.
+    pub fn add_shard(&mut self, doc_count: usize, per_term: &[(String, usize)]) {
+        self.total_docs += doc_count;
+        for (term, freq) in per_term {
+            *self.doc_freq.entry(term.clone()).or_insert(0) += freq;
+        }
+    }
+
+    /// Whether these statistics are usable. Empty ones mean "score locally".
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total_docs == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub doc: DocId,
@@ -108,14 +141,33 @@ fn phrase_matches(per_term: &[&Posting], _doc: DocId) -> bool {
 }
 
 /// Runs `query` against `segment` and returns at most `limit` hits, best first.
+///
+/// Scores with the segment's own statistics, which is correct when this
+/// segment is the whole corpus. For one shard of several, use
+/// [`search_with_stats`].
 pub fn search(segment: &Segment, query: &Query, limit: usize) -> Result<Vec<Hit>> {
+    search_with_stats(segment, query, limit, None)
+}
+
+/// Runs `query`, optionally scoring with corpus-wide statistics.
+///
+/// `global` of `None` — or empty statistics — falls back to the segment's own
+/// counts, so a single-shard deployment takes the same code path as a
+/// hundred-shard one and simply supplies nothing.
+pub fn search_with_stats(
+    segment: &Segment,
+    query: &Query,
+    limit: usize,
+    global: Option<&GlobalStats>,
+) -> Result<Vec<Hit>> {
     if query.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let total_docs = segment.document_count();
-    if total_docs == 0 {
+    if segment.document_count() == 0 {
         return Ok(Vec::new());
     }
+    let global = global.filter(|g| !g.is_empty());
+    let total_docs = global.map_or_else(|| segment.document_count(), |g| g.total_docs);
 
     // Postings for every term we care about, decoded once and shared between
     // the filtering pass and the scoring pass.
@@ -178,8 +230,16 @@ pub fn search(segment: &Segment, query: &Query, limit: usize) -> Result<Vec<Hit>
     // linear scan instead costs O(candidates x postings): on a 103k-document
     // index that was the difference between a 37 ms query and a 1 ms one.
     let mut scorers: Vec<(f32, &[Posting], usize)> = postings
-        .values()
-        .map(|list| (idf(total_docs, list.len()), list.as_slice(), 0usize))
+        .iter()
+        .map(|(term, list)| {
+            // The document frequency is this shard's unless a global one was
+            // supplied. A term absent from the global map is one no shard has
+            // seen, so the local count is the whole truth about it.
+            let doc_freq = global
+                .and_then(|g| g.doc_freq.get(term).copied())
+                .unwrap_or(list.len());
+            (idf(total_docs, doc_freq), list.as_slice(), 0usize)
+        })
         .collect();
 
     for &doc in &candidates {

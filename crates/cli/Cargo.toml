@@ -13,6 +13,7 @@ name = "indexander"
 path = "src/main.rs"
 
 [dependencies]
+indexander-cluster = { version = "0.1.0", path = "../cluster" }
 indexander-core.workspace = true
 indexander-crawl = { version = "0.1.0", path = "../crawl" }
 indexander-index.workspace = true

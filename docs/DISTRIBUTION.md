@@ -127,11 +127,12 @@ storage layer be boring, and the storage layer should be boring.
 
 ## Order of work
 
-1. Split the single process into `coordinator` and `shard` roles that talk over
-   a local socket, with `shard_count = 1`. Nothing distributed, but every call
-   that will cross the network already does.
-2. Global term statistics, two-round. Now scores are comparable, which is what
-   makes more than one shard meaningful.
+1. ~~Split the single process into `coordinator` and `shard` roles that talk
+   over a local socket, with `shard_count = 1`.~~ **Done.** `crates/proto`
+   carries the wire format and the routing; `crates/cluster` has both roles;
+   `indexander shard` and `indexander search --shards` drive them.
+2. ~~Global term statistics, two-round.~~ **Done**, and tested both in-process
+   and over sockets.
 3. Fetch leases, so a multi-node crawl is polite before there is a multi-node
    crawl.
 4. Distributed PageRank with boundary exchange.

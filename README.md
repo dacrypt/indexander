@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 27–36% of the text it indexes, across three real corpora |
 | Query latency | 1.2–1.4 ms over 103,257 documents; 376 µs for a phrase |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 138, including full crawls against a throwaway local server |
+| Tests | 178, including full crawls and two-shard queries over real sockets |
 | `unsafe` | none |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
 
@@ -145,6 +145,58 @@ called `authority_cannot_make_an_irrelevant_page_match` that says so. The
 logarithm is the other half: real web graphs span many orders of magnitude of
 rank, and without it authority would simply overwrite relevance.
 
+## Running it as a cluster
+
+```console
+$ indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
+shard listening on 127.0.0.1:7801: 200 documents, 410 terms
+
+$ indexander search "indices invertidos" --shards 127.0.0.1:7801,127.0.0.1:7802
+  1.   0.0025  /corpus/a/doc0.txt
+  ...
+3 results in 491.29µs across 2 shards (400 documents, connect 1.41ms)
+```
+
+This is step 1 of [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md): the process
+is split into roles that talk over a socket, so every call that will one day
+cross a network already does. One shard and fifty take the same code path.
+
+### A query is two rounds, and the first one is not an optimisation
+
+BM25 weights a term by how rare it is, and rarity is a property of the corpus.
+On one shard of several, the local counts are the wrong ones: a term rare in
+shard 3 and common in shard 7 is scored as rare in one and common in the other,
+so merging their top-k compares numbers that were never on the same scale. The
+merge does not fail — it quietly returns a plausible, wrong ranking.
+
+So round one asks every shard for its document count and its frequency for each
+query term, the coordinator sums them, and round two runs the search with those
+global numbers substituted. `crates/index/tests/sharding.rs` has both halves as
+tests: `local_statistics_produce_a_different_ranking_than_one_index` proves the
+bug is real, and `global_statistics_make_shards_agree_with_one_index` proves the
+fix works. `crates/cluster/tests/two_shards.rs` does the same over real sockets.
+
+### Routing
+
+Shard ownership is jump consistent hashing over the hash of the whole
+normalised URL. Not `hash % n`: growing from four shards to five moves 80% of
+the corpus with modulo, and exactly one fifth with jump hashing — there is a
+test that measures it, and another that checks everything which moved went *to*
+the new shard rather than being shuffled between the old ones.
+
+Hashing the whole URL rather than the host is deliberate. By host, a large site
+lands entirely on one shard, and the web's host-size distribution is such that
+one shard ends up holding a hundred times what another does. The cost is that a
+site's pages scatter, which matters for crawl politeness — and that is solved
+with per-host fetch leases, described in `docs/DISTRIBUTION.md`, not by
+sharding differently.
+
+### A missing shard fails the query
+
+Results computed from four shards out of five are not slightly worse results;
+they are results that silently omit a fifth of the corpus. The coordinator
+refuses to connect rather than degrade.
+
 ## How it works
 
 **Tokenizing.** Text splits on non-alphanumerics, lowercases, and folds
@@ -197,6 +249,8 @@ crates/core    vocabulary: DocId, Document, Field, Error — no dependencies
 crates/index   tokenizer, codec, segment format, query parser, BM25 search
 crates/crawl   robots.txt, HTML extraction, URL normalisation, frontier, fetch
 crates/rank    the link graph as CSR, and PageRank over it
+crates/proto   the coordinator/shard wire protocol and shard routing
+crates/cluster the coordinator and shard roles, over TCP
 crates/cli     the `indexander` binary
 ```
 
@@ -208,8 +262,12 @@ TLS stack from scratch would be a different project.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **Distribution.** The 2004 design sharded by URL across servers and this one
-  does not, yet. The pieces that need it are named in `docs/DISTRIBUTION.md`.
+- **Distribution beyond step 1.** The roles, the protocol, the routing and the
+  two-round query exist. What does not: fetch leases so a multi-node crawl is
+  polite, distributed PageRank with boundary exchange, and replication. Steps 3
+  to 5 of `docs/DISTRIBUTION.md`.
+- **Concurrent fan-out.** The coordinator queries shards one after another. The
+  rounds are already structured for it; the loops just need joining.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
 - **Memory mapping.** Segments are read into memory. `mmap` avoids the copy but

@@ -10,8 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use indexander_cluster::coordinator::Coordinator;
 use indexander_core::DocId;
 use indexander_core::Document;
 use indexander_crawl::Config;
@@ -30,7 +32,9 @@ USAGE:
     indexander crawl <url>... [--out <segment>] [--pages <n>] [--depth <n>]
                               [--delay <ms>] [--concurrency <n>] [--any-host]
     indexander index <directory> [--out <segment>]
+    indexander shard  --listen <addr> [--index <segment>]
     indexander search <query>... [--index <segment>] [--limit <n>]
+                                 [--shards <addr,addr,...>]
     indexander stats [--index <segment>]
 
 The default segment path is ./indexander.ixdr
@@ -40,6 +44,8 @@ EXAMPLES:
     indexander index ./docs
     indexander search motor de busqueda
     indexander search '\"inverted index\"' -perl --limit 5
+    indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
+    indexander search motor --shards 127.0.0.1:7801,127.0.0.1:7802
 ";
 
 const DEFAULT_SEGMENT: &str = "indexander.ixdr";
@@ -62,6 +68,7 @@ fn run(args: &[String]) -> Result<(), String> {
     };
     match command.as_str() {
         "crawl" => cmd_crawl(&args[1..]),
+        "shard" => cmd_shard(&args[1..]),
         "index" => cmd_index(&args[1..]),
         "search" => cmd_search(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
@@ -248,6 +255,75 @@ fn apply_pagerank(builder: &mut SegmentBuilder, graph_builder: GraphBuilder) -> 
     Ok(())
 }
 
+/// Serves one segment to a coordinator.
+fn cmd_shard(args: &[String]) -> Result<(), String> {
+    let (listen, rest) = take_option(args, "--listen");
+    let (index, _) = take_option(&rest, "--index");
+    let listen = listen.ok_or_else(|| format!("shard needs --listen\n\n{USAGE}"))?;
+    let segment = Arc::new(open_segment(index.as_deref())?);
+
+    println!(
+        "shard listening on {listen}: {} documents, {} terms",
+        segment.document_count(),
+        segment.term_count()
+    );
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&listen)
+            .await
+            .map_err(|e| format!("binding {listen}: {e}"))?;
+        indexander_cluster::shard::serve(listener, segment)
+            .await
+            .map_err(|e| format!("serving: {e}"))
+    })
+}
+
+/// Searches a cluster instead of a local segment.
+///
+/// This is the same two-round protocol whether there is one shard or fifty,
+/// which is the entire point of doing it before there are fifty.
+fn search_cluster(addresses: &[String], query_text: &str, limit: usize) -> Result<(), String> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
+    runtime.block_on(async {
+        let started = std::time::Instant::now();
+        let mut coordinator = Coordinator::connect(addresses)
+            .await
+            .map_err(|e| e.to_string())?;
+        let connected = started.elapsed();
+
+        let searching = std::time::Instant::now();
+        let hits = coordinator
+            .search(query_text, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        let elapsed = searching.elapsed();
+
+        if hits.is_empty() {
+            println!("no results ({elapsed:.2?})");
+            return Ok(());
+        }
+        for (rank, hit) in hits.iter().enumerate() {
+            println!("{:>3}. {:>8.4}  {}", rank + 1, hit.score, hit.uri);
+        }
+        let (documents, _) = coordinator.stats().await.map_err(|e| e.to_string())?;
+        println!(
+            "\n{} result{} in {:.2?} across {} shard{} ({documents} documents, connect {:.2?})",
+            hits.len(),
+            if hits.len() == 1 { "" } else { "s" },
+            elapsed,
+            coordinator.shard_count(),
+            if coordinator.shard_count() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            connected
+        );
+        Ok(())
+    })
+}
+
 fn cmd_index(args: &[String]) -> Result<(), String> {
     let (out, rest) = take_option(args, "--out");
     let directory = rest
@@ -303,6 +379,7 @@ fn cmd_index(args: &[String]) -> Result<(), String> {
 
 fn cmd_search(args: &[String]) -> Result<(), String> {
     let (index, rest) = take_option(args, "--index");
+    let (shards, rest) = take_option(&rest, "--shards");
     let (limit, rest) = take_option(&rest, "--limit");
     let limit: usize = limit
         .as_deref()
@@ -310,6 +387,18 @@ fn cmd_search(args: &[String]) -> Result<(), String> {
         .map_err(|_| "--limit needs a number".to_owned())?;
     if rest.is_empty() {
         return Err(format!("search needs a query\n\n{USAGE}"));
+    }
+
+    if let Some(shards) = shards {
+        let addresses: Vec<String> = shards
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if addresses.is_empty() {
+            return Err("--shards needs at least one address".to_owned());
+        }
+        return search_cluster(&addresses, &rest.join(" "), limit);
     }
 
     let segment = open_segment(index.as_deref())?;
