@@ -1,0 +1,256 @@
+//! Build a segment, write it, read it back, search it.
+//!
+//! These are the tests that would catch a mismatch between the writer and the
+//! reader, which unit tests on either side cannot.
+
+use indexander_core::{DocId, Document, Field};
+use indexander_index::builder::SegmentBuilder;
+use indexander_index::query;
+use indexander_index::search::search;
+use indexander_index::segment::Segment;
+
+fn corpus() -> Vec<Document> {
+    vec![
+        Document::new(
+            "doc://parasearch",
+            "Parasearch, un motor de búsqueda",
+            "Un buscador escrito en Perl en Colombia en 2004. El indexador se llamaba Indexander.",
+        )
+        .with_anchor("el buscador colombiano"),
+        Document::new(
+            "doc://indexander",
+            "Indexander",
+            "Motor de búsqueda escrito en Rust. Índice invertido posicional y ranking BM25.",
+        )
+        .with_anchor("motor de búsqueda en Rust"),
+        Document::new(
+            "doc://perl",
+            "Perl",
+            "Un lenguaje de programación. Nada que ver con motores de búsqueda distribuidos.",
+        ),
+    ]
+}
+
+fn build() -> Segment {
+    let mut builder = SegmentBuilder::new();
+    for doc in &corpus() {
+        builder.add(doc);
+    }
+    Segment::from_bytes(builder.encode()).expect("segment should parse")
+}
+
+#[test]
+fn segment_roundtrips_through_bytes() {
+    let segment = build();
+    assert_eq!(segment.document_count(), 3);
+    assert!(segment.term_count() > 20, "got {}", segment.term_count());
+    assert_eq!(segment.doc(DocId(0)).unwrap().uri, "doc://parasearch");
+    assert_eq!(segment.doc(DocId(2)).unwrap().uri, "doc://perl");
+    assert!(segment.doc(DocId(99)).is_none());
+}
+
+#[test]
+fn segment_roundtrips_through_a_file() {
+    let mut builder = SegmentBuilder::new();
+    for doc in &corpus() {
+        builder.add(doc);
+    }
+    let dir = std::env::temp_dir().join(format!("indexander-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("segment.ixdr");
+    builder.write_to(&path).unwrap();
+
+    let segment = Segment::open(&path).unwrap();
+    assert_eq!(segment.document_count(), 3);
+    let hits = search(&segment, &query::parse("indexander"), 10).unwrap();
+    assert_eq!(hits.len(), 2);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn postings_carry_positions_and_fields() {
+    let segment = build();
+    // "indexander" is in doc 0's body and doc 1's title.
+    let postings = segment.postings("indexander").unwrap();
+    assert_eq!(postings.len(), 2);
+    assert_eq!(postings[0].doc, DocId(0));
+    assert!(!postings[0].positions_in(Field::Body).is_empty());
+    assert!(postings[0].positions_in(Field::Title).is_empty());
+    assert_eq!(postings[1].doc, DocId(1));
+    assert!(!postings[1].positions_in(Field::Title).is_empty());
+}
+
+#[test]
+fn accented_text_is_findable_without_accents_and_with_them() {
+    let segment = build();
+    let without = search(&segment, &query::parse("busqueda"), 10).unwrap();
+    let with = search(&segment, &query::parse("búsqueda"), 10).unwrap();
+    assert!(!without.is_empty());
+    assert_eq!(without.len(), with.len());
+    assert_eq!(without[0].uri, with[0].uri);
+}
+
+#[test]
+fn the_2004_bug_would_fail_this_test() {
+    // parasearch folded "ñ" to "c", so a document containing "español"
+    // was indexed as "espacol" and this search returned nothing.
+    let mut builder = SegmentBuilder::new();
+    builder.add(&Document::new(
+        "doc://es",
+        "Español",
+        "Compañia Colombiana de Años",
+    ));
+    let segment = Segment::from_bytes(builder.encode()).unwrap();
+
+    for term in ["espanol", "compania", "anos", "español", "años"] {
+        let hits = search(&segment, &query::parse(term), 10).unwrap();
+        assert_eq!(hits.len(), 1, "searching for {term:?} found nothing");
+    }
+}
+
+#[test]
+fn all_terms_are_required() {
+    let segment = build();
+    // Only doc 1 has both.
+    let hits = search(&segment, &query::parse("rust bm25"), 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].uri, "doc://indexander");
+
+    // No document has this combination.
+    let hits = search(&segment, &query::parse("rust cobol"), 10).unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn a_phrase_requires_adjacency_in_order() {
+    let segment = build();
+    let hits = search(&segment, &query::parse(r#""motor de busqueda""#), 10).unwrap();
+    assert!(!hits.is_empty(), "the phrase should be found");
+
+    // The same words in the wrong order are not the same phrase.
+    let hits = search(&segment, &query::parse(r#""busqueda de motor""#), 10).unwrap();
+    assert!(hits.is_empty(), "word order must matter inside a phrase");
+}
+
+#[test]
+fn a_phrase_does_not_span_two_fields() {
+    // "Indexander" ends the title; "Motor" starts the body. Adjacent only if
+    // the two fields wrongly share a position space.
+    let mut builder = SegmentBuilder::new();
+    builder.add(&Document::new("doc://x", "Indexander", "Motor de busqueda"));
+    let segment = Segment::from_bytes(builder.encode()).unwrap();
+    let hits = search(&segment, &query::parse(r#""indexander motor""#), 10).unwrap();
+    assert!(hits.is_empty(), "a phrase must not straddle two fields");
+}
+
+#[test]
+fn exclusion_removes_documents() {
+    let segment = build();
+    let all = search(&segment, &query::parse("busqueda"), 10).unwrap();
+    let filtered = search(&segment, &query::parse("busqueda -perl"), 10).unwrap();
+    assert!(filtered.len() < all.len());
+    assert!(filtered.iter().all(|h| h.uri != "doc://perl"));
+}
+
+#[test]
+fn title_and_anchor_matches_outrank_body_matches() {
+    let mut builder = SegmentBuilder::new();
+    // Same word, same document length, different field.
+    builder.add(&Document::new("doc://body", "algo", "rust"));
+    builder.add(&Document::new("doc://title", "rust", "algo"));
+    let segment = Segment::from_bytes(builder.encode()).unwrap();
+
+    let hits = search(&segment, &query::parse("rust"), 10).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[0].uri, "doc://title",
+        "a title match should rank first"
+    );
+    assert!(hits[0].score > hits[1].score);
+}
+
+#[test]
+fn results_come_back_in_descending_score_order() {
+    let segment = build();
+    let hits = search(&segment, &query::parse("busqueda"), 10).unwrap();
+    for pair in hits.windows(2) {
+        assert!(pair[0].score >= pair[1].score, "results are not sorted");
+    }
+}
+
+#[test]
+fn limit_is_respected() {
+    let segment = build();
+    let hits = search(&segment, &query::parse("de"), 1).unwrap();
+    assert!(hits.len() <= 1);
+    assert!(search(&segment, &query::parse("de"), 0).unwrap().is_empty());
+}
+
+#[test]
+fn unknown_terms_and_empty_queries_return_nothing() {
+    let segment = build();
+    assert!(
+        search(&segment, &query::parse("kubernetes"), 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(search(&segment, &query::parse(""), 10).unwrap().is_empty());
+    assert!(segment.postings("kubernetes").unwrap().is_empty());
+}
+
+#[test]
+fn an_empty_index_is_searchable_and_returns_nothing() {
+    let segment = Segment::from_bytes(SegmentBuilder::new().encode()).unwrap();
+    assert_eq!(segment.document_count(), 0);
+    assert!(
+        search(&segment, &query::parse("cualquier cosa"), 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_truncated_segment_is_rejected_rather_than_misread() {
+    let mut builder = SegmentBuilder::new();
+    builder.add(&Document::new("doc://a", "t", "b"));
+    let mut bytes = builder.encode();
+    bytes.truncate(bytes.len() - 8);
+    assert!(Segment::from_bytes(bytes).is_err());
+    assert!(Segment::from_bytes(vec![0u8; 4]).is_err());
+    assert!(Segment::from_bytes(Vec::new()).is_err());
+}
+
+#[test]
+fn document_frequency_matches_the_postings_list() {
+    let segment = build();
+    for term in ["de", "indexander", "rust", "perl"] {
+        assert_eq!(
+            segment.document_frequency(term).unwrap(),
+            segment.postings(term).unwrap().len(),
+            "disagreement for {term:?}"
+        );
+    }
+}
+
+#[test]
+fn the_index_is_smaller_than_the_text_it_indexes() {
+    // The point of delta plus varint encoding, stated as a test.
+    let mut builder = SegmentBuilder::new();
+    let mut raw = 0usize;
+    for i in 0..500 {
+        let doc = Document::new(
+            format!("doc://{i}"),
+            format!("documento numero {i}"),
+            "el robeiro rastrea la web colombiana y el indexander la indexa \
+             palabra por palabra guardando posiciones y relevancia",
+        );
+        raw += doc.title.len() + doc.body.len() + doc.uri.len();
+        builder.add(&doc);
+    }
+    let encoded = builder.encode().len();
+    assert!(
+        encoded < raw,
+        "index is {encoded} bytes for {raw} bytes of text"
+    );
+}
