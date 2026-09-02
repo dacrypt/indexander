@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/index", "crates/cli"]
+members = ["crates/core", "crates/index", "crates/crawl", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ authors = ["David Velásquez"]
 [workspace.dependencies]
 indexander-core = { path = "crates/core", version = "0.1.0" }
 indexander-index = { path = "crates/index", version = "0.1.0" }
+indexander-crawl = { path = "crates/crawl", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

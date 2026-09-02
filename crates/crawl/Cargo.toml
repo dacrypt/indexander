@@ -1,0 +1,21 @@
+[package]
+name = "indexander-crawl"
+description = "A polite, asynchronous web crawler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+indexander-core = { version = "0.1.0", path = "../core" }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "gzip", "brotli", "http2", "charset"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

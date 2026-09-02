@@ -10,16 +10,22 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use std::time::Duration;
+
 use indexander_core::Document;
+use indexander_crawl::Config;
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::query;
 use indexander_index::search::search;
 use indexander_index::segment::Segment;
+use url::Url;
 
 const USAGE: &str = "\
 indexander — a search engine
 
 USAGE:
+    indexander crawl <url>... [--out <segment>] [--pages <n>] [--depth <n>]
+                              [--delay <ms>] [--concurrency <n>] [--any-host]
     indexander index <directory> [--out <segment>]
     indexander search <query>... [--index <segment>] [--limit <n>]
     indexander stats [--index <segment>]
@@ -27,6 +33,7 @@ USAGE:
 The default segment path is ./indexander.ixdr
 
 EXAMPLES:
+    indexander crawl https://example.com --pages 200 --depth 2
     indexander index ./docs
     indexander search motor de busqueda
     indexander search '\"inverted index\"' -perl --limit 5
@@ -51,6 +58,7 @@ fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     };
     match command.as_str() {
+        "crawl" => cmd_crawl(&args[1..]),
         "index" => cmd_index(&args[1..]),
         "search" => cmd_search(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
@@ -79,6 +87,111 @@ fn take_option(args: &[String], name: &str) -> (Option<String>, Vec<String>) {
         }
     }
     (value, rest)
+}
+
+/// Crawls the web from one or more seeds and indexes what comes back.
+///
+/// The crawl and the indexing run at the same time: pages are indexed as they
+/// arrive rather than after the crawl finishes, which is what keeps memory
+/// proportional to the index and not to the network.
+fn cmd_crawl(args: &[String]) -> Result<(), String> {
+    let (out, rest) = take_option(args, "--out");
+    let (pages, rest) = take_option(&rest, "--pages");
+    let (depth, rest) = take_option(&rest, "--depth");
+    let (delay, rest) = take_option(&rest, "--delay");
+    let (concurrency, rest) = take_option(&rest, "--concurrency");
+    let (any_host, seeds): (Vec<String>, Vec<String>) =
+        rest.into_iter().partition(|a| a == "--any-host");
+
+    if seeds.is_empty() {
+        return Err(format!("crawl needs at least one url\n\n{USAGE}"));
+    }
+    let seeds: Vec<Url> = seeds
+        .iter()
+        .map(|s| {
+            let with_scheme = if s.contains("://") {
+                s.clone()
+            } else {
+                format!("https://{s}")
+            };
+            Url::parse(&with_scheme).map_err(|e| format!("{s}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let parse_num = |value: Option<String>, name: &str, default: usize| -> Result<usize, String> {
+        value
+            .as_deref()
+            .map_or(Ok(default), str::parse)
+            .map_err(|_| format!("{name} needs a number"))
+    };
+
+    let mut config = Config::default();
+    config.limits.max_pages = parse_num(pages, "--pages", config.limits.max_pages)?;
+    config.limits.max_depth =
+        u32::try_from(parse_num(depth, "--depth", 3)?).map_err(|_| "--depth too large")?;
+    config.limits.max_pages_per_host = config.limits.max_pages;
+    config.limits.same_host_only = any_host.is_empty();
+    config.concurrency = parse_num(concurrency, "--concurrency", config.concurrency)?;
+    config.delay = Duration::from_millis(
+        parse_num(delay, "--delay", 500)?
+            .try_into()
+            .map_err(|_| "--delay too large")?,
+    );
+
+    let out = PathBuf::from(out.unwrap_or_else(|| DEFAULT_SEGMENT.to_owned()));
+    println!(
+        "crawling {} seed{} as {}",
+        seeds.len(),
+        if seeds.len() == 1 { "" } else { "s" },
+        config.user_agent
+    );
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
+    let started = std::time::Instant::now();
+
+    let (builder, stats) = runtime.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let crawling = indexander_crawl::crawl(&config, &seeds, tx);
+        let indexing = async {
+            let mut builder = SegmentBuilder::new();
+            while let Some(doc) = rx.recv().await {
+                if builder.document_count() % 25 == 0 && builder.document_count() > 0 {
+                    println!("  {} pages...", builder.document_count());
+                }
+                builder.add(&doc);
+            }
+            builder
+        };
+        let (stats, builder) = tokio::join!(crawling, indexing);
+        stats.map(|s| (builder, s))
+    })?;
+
+    builder
+        .write_to(&out)
+        .map_err(|e| format!("writing {}: {e}", out.display()))?;
+
+    let size = std::fs::metadata(&out).map_or(0, |m| m.len());
+    println!(
+        "\nfetched {}, indexed {}, {} terms in {:.2?}",
+        stats.fetched,
+        stats.indexed,
+        builder.term_count(),
+        started.elapsed()
+    );
+    if stats.disallowed_by_robots > 0 {
+        println!(
+            "{} url(s) skipped by robots.txt",
+            stats.disallowed_by_robots
+        );
+    }
+    if stats.skipped_content_type > 0 {
+        println!("{} url(s) skipped, not text", stats.skipped_content_type);
+    }
+    if stats.errors > 0 {
+        println!("{} url(s) failed to fetch", stats.errors);
+    }
+    println!("{} -> {}", out.display(), human_bytes(size));
+    Ok(())
 }
 
 fn cmd_index(args: &[String]) -> Result<(), String> {

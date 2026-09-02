@@ -1,14 +1,19 @@
 # indexander
 
-A search engine written in Rust: crawler-ready inverted index, positional
-postings, field-weighted BM25, and a command line that indexes a directory and
-searches it in about a millisecond.
+A search engine written in Rust: a polite asynchronous crawler, a positional
+inverted index, field-weighted BM25, and a command line that crawls a site or a
+directory and searches it in about a millisecond.
 
 It is the successor to [parasearch](https://github.com/dacrypt/parasearch), a
 search engine written in Perl in Colombia in 2004 that never shipped. That one
 is an archive. This one is meant to work.
 
 ```console
+$ indexander crawl https://example.com --pages 200 --depth 2
+crawling 1 seed as indexander/0.1.0 (+https://github.com/dacrypt/indexander)
+  25 pages...
+fetched 198, indexed 191, 48210 terms in 1m 42s
+
 $ indexander index ~/corpus
 indexed 103257 documents, 1285312 terms in 51.52s
 indexander.ixdr -> 222.6 MiB (31.7% of 702.2 MiB of text)
@@ -22,18 +27,17 @@ $ indexander search "inverted index" -perl --limit 5
 
 ## Status
 
-**Working, and honest about its edges.** The index, the query language and the
-ranking are real and tested. The crawler is not written yet — today the input is
-a directory of files.
+**Working, and honest about its edges.** The crawler, the index, the query
+language and the ranking are real and tested end to end.
 
 | | |
 |---|---|
 | Indexing | 702 MiB of text into a 222 MiB index in 51 s, single threaded |
 | Index size | 27–36% of the text it indexes, across three real corpora |
 | Query latency | 1.2–1.4 ms over 103,257 documents; 376 µs for a phrase |
-| Tests | 47, including a full write-then-read round trip |
+| Tests | 111, including full crawls against a throwaway local server |
 | `unsafe` | none |
-| Dependencies | none outside the standard library |
+| Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
 
 Those numbers come from `indexander index` and `indexander search` on the
 machine at hand, not from a model of what should be fast. Reproduce them with
@@ -48,6 +52,47 @@ cargo install --path crates/cli
 ```
 
 Requires Rust 1.85 or newer.
+
+## The crawler
+
+`indexander crawl <url>` walks a site and indexes it as it goes — pages are
+handed to the indexer as they arrive, so memory tracks the index, not the
+network.
+
+What "polite" means here is written down rather than implied:
+
+- **`robots.txt` is fetched once per host and obeyed.** The most specific
+  matching `User-agent` group wins and *replaces* the wildcard group rather than
+  adding to it; the longest matching path rule wins, and `Allow` breaks a tie.
+  `Disallow:` and `Disallow: /` are opposites, which is the single most common
+  way to get this wrong, so it has its own test.
+- **A host that cannot answer is not crawled.** If `robots.txt` fails with a
+  server error or a dead connection, that host is skipped entirely. Being unable
+  to ask is not permission.
+- **Requests to one host are spaced out**, and the host's own `Crawl-delay`
+  overrides ours when it asks for more. Concurrency is *across* hosts.
+- **Everything is bounded**: body size, redirect count, request timeout, crawl
+  depth, total pages, and pages per host.
+- **The crawler says who it is**, with a URL a site owner can visit.
+
+`rel="nofollow"`, `<meta name="robots">` and `<base href>` are all honoured.
+
+### Anchor text is the point
+
+When the home page links to `/motor.html` with the words *"el buscador
+colombiano de los noventa"*, those words describe the target, not the source.
+The frontier holds them until that page is fetched, then attaches them to it:
+
+```console
+$ indexander search colombiano
+  1.   0.5909  http://localhost/motor.html
+  2.   0.4832  http://localhost/
+```
+
+`motor.html` does not contain the word "colombiano" anywhere. It ranks first for
+it anyway, above the page that *does* contain it, because anchor text is
+weighted 2× and body text 1×. That is the `anchor_queue` of the 2004 design
+doing exactly what it was designed to do.
 
 ## How it works
 
@@ -99,15 +144,18 @@ Accents and case are folded the same way as at index time, so `Búsqueda`,
 ```
 crates/core    vocabulary: DocId, Document, Field, Error — no dependencies
 crates/index   tokenizer, codec, segment format, query parser, BM25 search
+crates/crawl   robots.txt, HTML extraction, URL normalisation, frontier, fetch
 crates/cli     the `indexander` binary
 ```
+
+`core` and `index` deliberately depend on nothing but the standard library. The
+crawler is where the dependencies live, because writing an HTTP client and a
+TLS stack from scratch would be a different project.
 
 ## What is not built yet
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **The crawler.** The whole point of the name it inherits. Async, polite,
-  `robots.txt`-aware, with a frontier and per-host rate limiting.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
 - **Memory mapping.** Segments are read into memory. `mmap` avoids the copy but
@@ -116,6 +164,12 @@ Stated plainly, because a README that only lists what works is a sales page:
   per-document work is independent; this is the largest easy win available.
 - **Snippets.** Positions are stored, so highlighted extracts are a query away.
 - **An HTTP API and a UI.** There is a CLI and a library.
+- **A real HTML parser.** `crates/crawl/src/extract.rs` is a scanner, not a
+  parser: it walks the bytes once and never builds a tree. It handles the
+  malformed markup it has been shown, and every case has a test, but a
+  `html5ever`-grade tokenizer would handle more.
+- **Crawl state that survives a restart.** The frontier is in memory, so a
+  crawl that stops starts over.
 
 ## Lineage
 
