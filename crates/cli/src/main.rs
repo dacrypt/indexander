@@ -113,7 +113,7 @@ fn cmd_index(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("writing {}: {e}", out.display()))?;
 
     let elapsed = started.elapsed();
-    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    let size = std::fs::metadata(&out).map_or(0, |m| m.len());
     println!(
         "indexed {} documents, {} terms in {:.2?}",
         builder.document_count(),
