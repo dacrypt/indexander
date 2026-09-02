@@ -32,11 +32,11 @@ language and the ranking are real and tested end to end.
 
 | | |
 |---|---|
-| Indexing | 702 MiB of text into a 222 MiB index in 51 s, single threaded |
+| Indexing | 702 MiB of text into a 222 MiB index in 9.5–15.2 s on 14 threads, from 52.9–61.4 s on one |
 | Index size | 27–36% of the text it indexes, across three real corpora |
 | Query latency | 1.2–1.4 ms over 103,257 documents; 376 µs for a phrase |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 178, including full crawls and two-shard queries over real sockets |
+| Tests | 187, including full crawls and eight-shard queries over real sockets |
 | `unsafe` | none |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
 
@@ -157,6 +157,12 @@ $ indexander search "indices invertidos" --shards 127.0.0.1:7801,127.0.0.1:7802
 3 results in 491.29µs across 2 shards (400 documents, connect 1.41ms)
 ```
 
+Both rounds fan out concurrently, and so does connecting, so a round costs the
+slowest shard rather than the sum of all of them: four shards holding 8,000
+documents answer in 0.79–1.05 ms. Replies are merged in shard order whatever
+order they arrive in, so a repeated query returns exactly the same ranking —
+there is a test that runs one twenty times to check.
+
 This is step 1 of [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md): the process
 is split into roles that talk over a socket, so every call that will one day
 cross a network already does. One shard and fifty take the same code path.
@@ -226,6 +232,24 @@ term touches `log2(n)` cache lines and allocates nothing.
 **Ranking is Okapi BM25** with `k1 = 1.2` and `b = 0.75`, over the
 field-weighted term frequency.
 
+**Indexing runs on every core.** Tokenising a document depends on nothing but
+that document, so the corpus splits across threads and the partial indexes are
+stitched back together. The stitching is itself a parallel tree merge rather
+than a chain, because with fourteen threads the serial tail is most of what is
+left to save: chaining gave 4.1×, the tree gives about 5×.
+
+The output is **byte-identical to the single-threaded build** — same MD5 — which
+is the only verification of a parallel rewrite worth having, and
+`chunked_building_is_byte_identical_to_one_pass` asserts it for every chunk
+count from 1 to one-document-per-chunk.
+
+**Scores are reproducible bit for bit.** Floating-point addition is not
+associative, so summing a document's per-term contributions in `HashMap` order
+made the same document score `9.72467` in one process and `9.724671` in
+another — two shards holding identical data would have disagreed, and no
+ranking comparison would have been trustworthy. Terms are now summed in sorted
+order. `scores_are_bit_for_bit_reproducible` exists because this bug was real.
+
 **Scoring walks sorted lists together.** Candidates ascend, postings ascend, so
 one cursor per term advances monotonically. The first version looked each
 candidate up with a linear scan; replacing that took a query over 103k documents
@@ -266,8 +290,6 @@ Stated plainly, because a README that only lists what works is a sales page:
   two-round query exist. What does not: fetch leases so a multi-node crawl is
   polite, distributed PageRank with boundary exchange, and replication. Steps 3
   to 5 of `docs/DISTRIBUTION.md`.
-- **Concurrent fan-out.** The coordinator queries shards one after another. The
-  rounds are already structured for it; the loops just need joining.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
 - **Memory mapping.** Segments are read into memory. `mmap` avoids the copy but

@@ -229,8 +229,18 @@ pub fn search_with_stats(
     // them together with one cursor per term. Looking each candidate up with a
     // linear scan instead costs O(candidates x postings): on a 103k-document
     // index that was the difference between a 37 ms query and a 1 ms one.
-    let mut scorers: Vec<(f32, &[Posting], usize)> = postings
+    // Iterated in sorted term order, not in `HashMap` order.
+    //
+    // Floating-point addition is not associative, so the order in which a
+    // document's per-term contributions are summed changes the last bits of
+    // its score. A `HashMap` is seeded differently in every process, so two
+    // shards holding byte-identical segments would score the same document
+    // differently, ties would break arbitrarily between runs, and no ranking
+    // comparison would be reproducible. `scoring_terms` is already sorted.
+    let ordered_terms = query.scoring_terms();
+    let mut scorers: Vec<(f32, &[Posting], usize)> = ordered_terms
         .iter()
+        .filter_map(|term| postings.get(term).map(|list| (term, list)))
         .map(|(term, list)| {
             // The document frequency is this shard's unless a global one was
             // supplied. A term absent from the global map is one no shard has

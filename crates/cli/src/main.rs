@@ -287,7 +287,7 @@ fn search_cluster(addresses: &[String], query_text: &str, limit: usize) -> Resul
     let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
     runtime.block_on(async {
         let started = std::time::Instant::now();
-        let mut coordinator = Coordinator::connect(addresses)
+        let coordinator = Coordinator::connect(addresses)
             .await
             .map_err(|e| e.to_string())?;
         let connected = started.elapsed();
@@ -332,24 +332,9 @@ fn cmd_index(args: &[String]) -> Result<(), String> {
     let out = PathBuf::from(out.unwrap_or_else(|| DEFAULT_SEGMENT.to_owned()));
 
     let started = std::time::Instant::now();
-    let mut builder = SegmentBuilder::new();
-    let mut bytes_read = 0u64;
-
-    for path in collect_files(Path::new(directory))? {
-        let Ok(raw) = std::fs::read(&path) else {
-            continue;
-        };
-        if is_binary(&raw) {
-            continue;
-        }
-        let body = decode(raw);
-        bytes_read += body.len() as u64;
-        let title = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().replace(['-', '_'], " "))
-            .unwrap_or_default();
-        builder.add(&Document::new(path.to_string_lossy(), title, body));
-    }
+    let files = collect_files(Path::new(directory))?;
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let (builder, bytes_read) = build_index(&files, threads);
 
     builder
         .write_to(&out)
@@ -358,10 +343,11 @@ fn cmd_index(args: &[String]) -> Result<(), String> {
     let elapsed = started.elapsed();
     let size = std::fs::metadata(&out).map_or(0, |m| m.len());
     println!(
-        "indexed {} documents, {} terms in {:.2?}",
+        "indexed {} documents, {} terms in {:.2?} on {threads} thread{}",
         builder.document_count(),
         builder.term_count(),
-        elapsed
+        elapsed,
+        if threads == 1 { "" } else { "s" }
     );
     println!(
         "{} -> {} ({:.1}% of {} of text)",
@@ -375,6 +361,94 @@ fn cmd_index(args: &[String]) -> Result<(), String> {
         human_bytes(bytes_read)
     );
     Ok(())
+}
+
+/// Reads and indexes `files`, using `threads` of them.
+///
+/// Tokenising a document depends on nothing but that document, so the corpus
+/// splits cleanly. Each thread builds a partial index over a contiguous slice
+/// and the parts are stitched together with `absorb`, which shifts document
+/// ids so the result is exactly what a single pass would have produced -
+/// `chunked_building_is_byte_identical_to_one_pass` is the test that says so.
+///
+/// Slices are contiguous rather than interleaved so document ids stay in file
+/// order, which keeps a rebuild reproducible.
+fn build_index(files: &[PathBuf], threads: usize) -> (SegmentBuilder, u64) {
+    let threads = threads.max(1).min(files.len().max(1));
+    let chunk = files.len().div_ceil(threads).max(1);
+
+    let parts: Vec<(SegmentBuilder, u64)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(chunk)
+            .map(|slice| scope.spawn(move || index_files(slice)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| (SegmentBuilder::new(), 0)))
+            .collect()
+    });
+
+    merge_tree(parts)
+}
+
+/// Merges partial indexes pairwise, in parallel, until one is left.
+///
+/// Absorbing them one after another into the first is correct but serial, and
+/// with fourteen threads that tail is most of what is left to save: merging
+/// costs roughly the size of what is merged, so a chain does `n` merges of a
+/// growing index while a tree does the same total work in `log2(n)` rounds
+/// that each run concurrently.
+///
+/// The order of absorption is preserved exactly — adjacent parts only, left
+/// into right — so document ids stay in corpus order and the result is still
+/// byte-identical to a single-threaded build.
+fn merge_tree(mut parts: Vec<(SegmentBuilder, u64)>) -> (SegmentBuilder, u64) {
+    while parts.len() > 1 {
+        parts = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(parts.len().div_ceil(2));
+            // `into_iter` in chunks of two: each pair merges independently.
+            let mut iter = parts.into_iter();
+            while let Some(left) = iter.next() {
+                match iter.next() {
+                    Some(right) => handles.push(scope.spawn(move || {
+                        let (mut a, a_bytes) = left;
+                        let (b, b_bytes) = right;
+                        a.absorb(b);
+                        (a, a_bytes + b_bytes)
+                    })),
+                    // An odd part rides to the next round untouched.
+                    None => handles.push(scope.spawn(move || left)),
+                }
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| (SegmentBuilder::new(), 0)))
+                .collect()
+        });
+    }
+    parts.pop().unwrap_or_else(|| (SegmentBuilder::new(), 0))
+}
+
+/// Indexes one slice of the corpus into its own builder.
+fn index_files(files: &[PathBuf]) -> (SegmentBuilder, u64) {
+    let mut builder = SegmentBuilder::new();
+    let mut bytes = 0u64;
+    for path in files {
+        let Ok(raw) = std::fs::read(path) else {
+            continue;
+        };
+        if is_binary(&raw) {
+            continue;
+        }
+        let body = decode(raw);
+        bytes += body.len() as u64;
+        let title = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().replace(['-', '_'], " "))
+            .unwrap_or_default();
+        builder.add(&Document::new(path.to_string_lossy(), title, body));
+    }
+    (builder, bytes)
 }
 
 fn cmd_search(args: &[String]) -> Result<(), String> {

@@ -136,6 +136,33 @@ impl SegmentBuilder {
         self.docs.get(id.as_usize()).map(|d| d.uri.as_str())
     }
 
+    /// Absorbs another builder, as if its documents had been added after
+    /// these ones.
+    ///
+    /// This is what makes indexing parallelisable: tokenising a document is
+    /// independent of every other document, so a corpus can be split, built on
+    /// several threads, and stitched back together here. Document ids from
+    /// `other` are shifted by however many documents this builder already
+    /// holds, which keeps them dense, ascending and in corpus order — exactly
+    /// the invariant delta encoding depends on.
+    ///
+    /// # Panics
+    ///
+    /// If the two builders together hold more than `u32::MAX` documents.
+    pub fn absorb(&mut self, other: Self) {
+        let shift = u32::try_from(self.docs.len()).expect("more than u32::MAX documents");
+
+        for (term, docs) in other.terms {
+            let entry = self.terms.entry(term).or_default();
+            for (id, occurrences) in docs {
+                // The shifted id cannot collide: `other`'s ids start at zero
+                // and this builder's stop at `shift - 1`.
+                entry.insert(DocId(id.0 + shift), occurrences);
+            }
+        }
+        self.docs.extend(other.docs);
+    }
+
     /// Serialises the segment. See `segment.rs` for the layout.
     ///
     /// # Panics

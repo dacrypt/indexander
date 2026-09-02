@@ -9,11 +9,13 @@
 //! twice, not the sum of all of them.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use indexander_core::{Error, Result};
 use indexander_index::query;
 use indexander_proto::message::{Hit, PROTOCOL_VERSION, Request, Response};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 use crate::frame::{read_frame, read_hello, write_frame, write_hello};
 
@@ -53,9 +55,13 @@ impl ShardConnection {
 }
 
 /// A fixed set of shards.
+///
+/// Each connection sits behind its own lock, so the coordinator can hold all
+/// of them at once and drive every shard concurrently. There is no contention:
+/// exactly one task ever touches a given connection at a time.
 #[derive(Debug)]
 pub struct Coordinator {
-    shards: Vec<ShardConnection>,
+    shards: Vec<Arc<Mutex<ShardConnection>>>,
 }
 
 impl Coordinator {
@@ -65,13 +71,26 @@ impl Coordinator {
     /// results computed from four shards out of five are not "slightly worse
     /// results", they are results that silently omit a fifth of the corpus.
     pub async fn connect(addresses: &[String]) -> Result<Self> {
+        // Connecting is itself fanned out: with fifty shards, doing it one at
+        // a time makes startup fifty round trips deep.
+        let attempts: Vec<_> = addresses
+            .iter()
+            .map(|address| {
+                let address = address.clone();
+                tokio::spawn(async move {
+                    ShardConnection::connect(&address)
+                        .await
+                        .map_err(|e| Error::Corrupt(format!("shard {address}: {e}")))
+                })
+            })
+            .collect();
+
         let mut shards = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            shards.push(
-                ShardConnection::connect(address)
-                    .await
-                    .map_err(|e| Error::Corrupt(format!("shard {address}: {e}")))?,
-            );
+        for attempt in attempts {
+            let connection = attempt
+                .await
+                .map_err(|e| Error::Corrupt(format!("connect task failed: {e}")))??;
+            shards.push(Arc::new(Mutex::new(connection)));
         }
         if shards.is_empty() {
             return Err(Error::Corrupt(
@@ -87,23 +106,22 @@ impl Coordinator {
     }
 
     /// Round one: the corpus-wide statistics for these terms.
-    pub async fn term_statistics(&mut self, terms: &[String]) -> Result<GlobalTermStats> {
+    pub async fn term_statistics(&self, terms: &[String]) -> Result<GlobalTermStats> {
         let request = Request::TermStats {
             terms: terms.to_vec(),
         };
         let mut total_docs = 0usize;
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
 
-        for shard in &mut self.shards {
-            match shard.call(&request).await? {
+        for (address, response) in self.broadcast(&request).await? {
+            match response {
                 Response::TermStats {
                     doc_count,
                     doc_freq: per_term,
                 } => {
                     if per_term.len() != terms.len() {
                         return Err(Error::Corrupt(format!(
-                            "shard {} answered {} frequencies for {} terms",
-                            shard.address(),
+                            "shard {address} answered {} frequencies for {} terms",
                             per_term.len(),
                             terms.len()
                         )));
@@ -114,15 +132,11 @@ impl Coordinator {
                     }
                 }
                 Response::Error { message } => {
-                    return Err(Error::Corrupt(format!(
-                        "shard {}: {message}",
-                        shard.address()
-                    )));
+                    return Err(Error::Corrupt(format!("shard {address}: {message}")));
                 }
                 other => {
                     return Err(Error::Corrupt(format!(
-                        "shard {} answered {other:?} to a term-stats request",
-                        shard.address()
+                        "shard {address} answered {other:?} to a term-stats request"
                     )));
                 }
             }
@@ -134,7 +148,7 @@ impl Coordinator {
     }
 
     /// Runs a query across every shard and returns the global top `limit`.
-    pub async fn search(&mut self, query_text: &str, limit: usize) -> Result<Vec<Hit>> {
+    pub async fn search(&self, query_text: &str, limit: usize) -> Result<Vec<Hit>> {
         let parsed = query::parse(query_text);
         if parsed.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -157,22 +171,18 @@ impl Coordinator {
         };
 
         let mut all: Vec<Hit> = Vec::new();
-        for shard in &mut self.shards {
-            match shard.call(&request).await? {
+        for (address, response) in self.broadcast(&request).await? {
+            match response {
                 // Each shard returns its own top `limit`; the global top
                 // `limit` is necessarily a subset of the union, so nothing is
                 // lost by asking for no more than that from each.
                 Response::Hits { hits } => all.extend(hits),
                 Response::Error { message } => {
-                    return Err(Error::Corrupt(format!(
-                        "shard {}: {message}",
-                        shard.address()
-                    )));
+                    return Err(Error::Corrupt(format!("shard {address}: {message}")));
                 }
                 other => {
                     return Err(Error::Corrupt(format!(
-                        "shard {} answered {other:?} to a search",
-                        shard.address()
+                        "shard {address} answered {other:?} to a search"
                     )));
                 }
             }
@@ -188,16 +198,50 @@ impl Coordinator {
         Ok(all)
     }
 
+    /// Sends one request to every shard at once.
+    ///
+    /// Concurrent, so a round costs the slowest shard rather than the sum of
+    /// all of them — the difference between sharding helping and hurting.
+    /// Results come back in shard order regardless of who answered first, so
+    /// that a query is reproducible.
+    async fn broadcast(&self, request: &Request) -> Result<Vec<(String, Response)>> {
+        let calls: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| {
+                let shard = Arc::clone(shard);
+                let request = request.clone();
+                tokio::spawn(async move {
+                    let mut guard = shard.lock().await;
+                    let address = guard.address().to_owned();
+                    guard
+                        .call(&request)
+                        .await
+                        .map(|response| (address, response))
+                })
+            })
+            .collect();
+
+        let mut out = Vec::with_capacity(calls.len());
+        for call in calls {
+            out.push(
+                call.await
+                    .map_err(|e| Error::Corrupt(format!("shard task failed: {e}")))??,
+            );
+        }
+        Ok(out)
+    }
+
     /// Totals across the cluster.
-    pub async fn stats(&mut self) -> Result<(usize, usize)> {
+    pub async fn stats(&self) -> Result<(usize, usize)> {
         let mut documents = 0;
         let mut terms = 0;
-        for shard in &mut self.shards {
+        for (_, response) in self.broadcast(&Request::Stats).await? {
             if let Response::Stats {
                 documents: d,
                 terms: t,
                 ..
-            } = shard.call(&Request::Stats).await?
+            } = response
             {
                 documents += d;
                 // Term counts overlap between shards, so this is an upper

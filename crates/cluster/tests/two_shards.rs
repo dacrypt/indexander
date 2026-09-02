@@ -78,7 +78,7 @@ async fn one_shard_answers_exactly_like_a_local_index() {
     all.extend(shard_b());
     let address = start(&all).await;
 
-    let mut coordinator = Coordinator::connect(&[address]).await.expect("connect");
+    let coordinator = Coordinator::connect(&[address]).await.expect("connect");
     assert_eq!(coordinator.shard_count(), 1);
 
     let hits = coordinator.search("rust perl", 5).await.expect("search");
@@ -94,7 +94,7 @@ async fn two_shards_agree_with_one_index() {
     let a = start(&shard_a()).await;
     let b = start(&shard_b()).await;
 
-    let mut coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
+    let coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
     assert_eq!(coordinator.shard_count(), 2);
 
     let hits = coordinator.search("rust perl", 5).await.expect("search");
@@ -107,7 +107,7 @@ async fn two_shards_agree_with_one_index() {
 async fn round_one_sums_the_shards() {
     let a = start(&shard_a()).await;
     let b = start(&shard_b()).await;
-    let mut coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
+    let coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
 
     let stats = coordinator
         .term_statistics(&["rust".to_owned(), "perl".to_owned()])
@@ -126,7 +126,7 @@ async fn round_one_sums_the_shards() {
 async fn the_cluster_reports_its_totals() {
     let a = start(&shard_a()).await;
     let b = start(&shard_b()).await;
-    let mut coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
+    let coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
     let (documents, terms) = coordinator.stats().await.expect("stats");
     assert_eq!(documents, 110);
     assert!(terms > 0);
@@ -150,7 +150,7 @@ async fn a_coordinator_needs_at_least_one_shard() {
 #[tokio::test]
 async fn empty_and_zero_limit_queries_ask_the_shards_nothing() {
     let a = start(&shard_a()).await;
-    let mut coordinator = Coordinator::connect(&[a]).await.expect("connect");
+    let coordinator = Coordinator::connect(&[a]).await.expect("connect");
     assert!(coordinator.search("", 10).await.expect("search").is_empty());
     assert!(
         coordinator
@@ -165,9 +165,47 @@ async fn empty_and_zero_limit_queries_ask_the_shards_nothing() {
 async fn the_same_connection_serves_many_queries() {
     // Connections are long-lived; a second query must not need a reconnect.
     let a = start(&shard_a()).await;
-    let mut coordinator = Coordinator::connect(&[a]).await.expect("connect");
+    let coordinator = Coordinator::connect(&[a]).await.expect("connect");
     for _ in 0..5 {
         let hits = coordinator.search("rust", 3).await.expect("search");
         assert!(!hits.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn many_shards_give_the_same_answer_as_one_index() {
+    // Eight shards, so the fan-out is doing real work. Splitting the corpus
+    // further must not change the ranking.
+    let mut all = shard_a();
+    all.extend(shard_b());
+    let chunk = all.len().div_ceil(8);
+
+    let mut addresses = Vec::new();
+    for slice in all.chunks(chunk) {
+        addresses.push(start(slice).await);
+    }
+    assert_eq!(addresses.len(), 8);
+
+    let coordinator = Coordinator::connect(&addresses).await.expect("connect");
+    let hits = coordinator.search("rust perl", 5).await.expect("search");
+    let uris: Vec<String> = hits.into_iter().map(|h| h.uri).collect();
+    assert_eq!(uris, single_index_ranking(5));
+}
+
+#[tokio::test]
+async fn results_do_not_depend_on_which_shard_answers_first() {
+    // The fan-out is concurrent, so replies arrive in whatever order the
+    // network gives them. The merge must not inherit that order.
+    let a = start(&shard_a()).await;
+    let b = start(&shard_b()).await;
+    let coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
+
+    let first = coordinator.search("rust perl", 5).await.expect("search");
+    for _ in 0..20 {
+        let again = coordinator.search("rust perl", 5).await.expect("search");
+        assert_eq!(
+            again, first,
+            "a repeated query returned a different ranking"
+        );
     }
 }
