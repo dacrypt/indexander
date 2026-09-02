@@ -35,7 +35,7 @@ use indexander_core::{DocId, Error, Field, Position, Result};
 use crate::codec::{read_deltas, read_varint};
 
 pub(crate) const MAGIC: &[u8; 4] = b"IXDR";
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 /// Six u64 offsets, a u32 version, a 4-byte magic.
 pub(crate) const FOOTER_LEN: usize = 6 * 8 + 4 + 4;
 
@@ -76,11 +76,13 @@ impl Posting {
 }
 
 /// Stored metadata for one document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DocMeta {
     pub uri: String,
     /// Token count per field, indexed by `Field as usize`.
     pub lengths: [u32; 3],
+    /// PageRank of this document, or 0 if the index was built without a graph.
+    pub rank: f32,
 }
 
 impl DocMeta {
@@ -196,7 +198,17 @@ impl Segment {
                 *slot = u32::try_from(read_varint(bytes, &mut cursor)?)
                     .map_err(|_| Error::Corrupt("field length exceeds u32".into()))?;
             }
-            docs.push(DocMeta { uri, lengths });
+            let rank_at = cursor;
+            let rank_bytes: [u8; 4] = bytes
+                .get(rank_at..rank_at + 4)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| Error::Corrupt("document store ends mid-rank".into()))?;
+            cursor += 4;
+            docs.push(DocMeta {
+                uri,
+                lengths,
+                rank: f32::from_le_bytes(rank_bytes),
+            });
         }
         Ok(docs)
     }

@@ -1,3 +1,7 @@
 # Keep clippy honest about the MSRV declared in Cargo.toml: without this it
 # suggests idioms that do not compile on the oldest supported compiler.
 msrv = "1.85.0"
+
+# Proper nouns that appear in prose, not identifiers needing backticks.
+# ".." keeps clippy's own default list.
+doc-valid-idents = ["PageRank", "BM25", "LEB128", "HTML", "TLS", ".."]

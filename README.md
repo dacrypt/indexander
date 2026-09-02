@@ -1,8 +1,8 @@
 # indexander
 
 A search engine written in Rust: a polite asynchronous crawler, a positional
-inverted index, field-weighted BM25, and a command line that crawls a site or a
-directory and searches it in about a millisecond.
+inverted index, PageRank over the link graph, field-weighted BM25, and a
+command line that crawls a site and searches it in about a millisecond.
 
 It is the successor to [parasearch](https://github.com/dacrypt/parasearch), a
 search engine written in Perl in Colombia in 2004 that never shipped. That one
@@ -35,7 +35,8 @@ language and the ranking are real and tested end to end.
 | Indexing | 702 MiB of text into a 222 MiB index in 51 s, single threaded |
 | Index size | 27–36% of the text it indexes, across three real corpora |
 | Query latency | 1.2–1.4 ms over 103,257 documents; 376 µs for a phrase |
-| Tests | 111, including full crawls against a throwaway local server |
+| Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
+| Tests | 138, including full crawls against a throwaway local server |
 | `unsafe` | none |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
 
@@ -94,6 +95,56 @@ it anyway, above the page that *does* contain it, because anchor text is
 weighted 2× and body text 1×. That is the `anchor_queue` of the 2004 design
 doing exactly what it was designed to do.
 
+## PageRank
+
+The crawler already sees every link, so it carries them out with each page and
+the whole crawl becomes a graph. PageRank runs over it before the segment is
+written, and each document's score is stored beside its length.
+
+```console
+$ indexander crawl http://localhost:8732/
+link graph: 7 nodes, 10 edges; pagerank converged in 24 iterations
+
+most linked-to pages:
+  0.46578  http://localhost:8732/autoridad.html
+  0.09125  http://localhost:8732/hoja1.html
+  ...
+```
+
+Six of those pages have **byte-identical text**. Only their position in the
+graph differs:
+
+```console
+$ indexander search "motor de busqueda distribuido"
+  1.   2.3576  http://localhost:8732/autoridad.html
+  2.   1.6530  http://localhost:8732/hoja1.html
+  3.   1.6530  http://localhost:8732/hoja2.html
+```
+
+Three things about the implementation are worth stating, because they are where
+PageRank is usually got wrong:
+
+- **Dangling nodes do not drain the graph.** A page with no outlinks is a sink;
+  its mass has nowhere to flow. Unless it is put back into circulation every
+  iteration, the whole vector decays toward zero and the ranking becomes
+  plausible-looking noise. `ranks_sum_to_one` is the test that would catch it.
+- **It iterates until it stops moving**, not a fixed number of times, and it
+  reports whether it converged and after how many iterations.
+- **A repeated link is one vote.** A navigation menu appearing on every page
+  would otherwise decide the ranking of the whole site.
+
+### Authority scales relevance; it never creates it
+
+```rust
+score = bm25 * (1.0 + 0.5 * ln_1p(rank * document_count))
+```
+
+The multiplication is the point. A page that does not match the query scores
+zero, and zero times any amount of authority is still zero — there is a test
+called `authority_cannot_make_an_irrelevant_page_match` that says so. The
+logarithm is the other half: real web graphs span many orders of magnitude of
+rank, and without it authority would simply overwrite relevance.
+
 ## How it works
 
 **Tokenizing.** Text splits on non-alphanumerics, lowercases, and folds
@@ -145,6 +196,7 @@ Accents and case are folded the same way as at index time, so `Búsqueda`,
 crates/core    vocabulary: DocId, Document, Field, Error — no dependencies
 crates/index   tokenizer, codec, segment format, query parser, BM25 search
 crates/crawl   robots.txt, HTML extraction, URL normalisation, frontier, fetch
+crates/rank    the link graph as CSR, and PageRank over it
 crates/cli     the `indexander` binary
 ```
 
@@ -156,6 +208,8 @@ TLS stack from scratch would be a different project.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
+- **Distribution.** The 2004 design sharded by URL across servers and this one
+  does not, yet. The pieces that need it are named in `docs/DISTRIBUTION.md`.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
 - **Memory mapping.** Segments are read into memory. `mmap` avoids the copy but

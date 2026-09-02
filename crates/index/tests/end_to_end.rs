@@ -254,3 +254,97 @@ fn the_index_is_smaller_than_the_text_it_indexes() {
         "index is {encoded} bytes for {raw} bytes of text"
     );
 }
+
+// --- authority -----------------------------------------------------------
+//
+// PageRank only matters if it changes the answer. These build the same corpus
+// twice, with and without ranks, and assert that the order moves.
+
+use indexander_index::builder::SegmentBuilder as Builder;
+
+/// Two pages that match a query equally well. One is authoritative.
+fn two_equal_pages() -> Builder {
+    let mut builder = Builder::new();
+    builder.add(&Document::new(
+        "doc://obscure",
+        "buscador",
+        "un buscador colombiano",
+    ));
+    builder.add(&Document::new(
+        "doc://famous",
+        "buscador",
+        "un buscador colombiano",
+    ));
+    builder
+}
+
+#[test]
+fn without_ranks_two_identical_pages_tie() {
+    let segment = Segment::from_bytes(two_equal_pages().encode()).unwrap();
+    let hits = search(&segment, &query::parse("buscador"), 10).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(
+        (hits[0].score - hits[1].score).abs() < 1e-6,
+        "identical pages scored differently: {} vs {}",
+        hits[0].score,
+        hits[1].score
+    );
+}
+
+#[test]
+fn authority_breaks_the_tie_and_reorders_results() {
+    let mut builder = two_equal_pages();
+    // doc 1 is the authoritative one; doc 0 is ordinary.
+    builder.set_rank(DocId(0), 0.01);
+    builder.set_rank(DocId(1), 0.90);
+    let segment = Segment::from_bytes(builder.encode()).unwrap();
+
+    let hits = search(&segment, &query::parse("buscador"), 10).unwrap();
+    assert_eq!(hits[0].uri, "doc://famous", "authority did not win");
+    assert!(hits[0].score > hits[1].score);
+}
+
+#[test]
+fn authority_cannot_make_an_irrelevant_page_match() {
+    let mut builder = Builder::new();
+    builder.add(&Document::new("doc://authority", "portada", "nada que ver"));
+    builder.add(&Document::new(
+        "doc://relevant",
+        "perl",
+        "un motor escrito en perl",
+    ));
+    // Give the irrelevant page overwhelming authority.
+    builder.set_rank(DocId(0), 0.99);
+    builder.set_rank(DocId(1), 0.00001);
+    let segment = Segment::from_bytes(builder.encode()).unwrap();
+
+    let hits = search(&segment, &query::parse("perl"), 10).unwrap();
+    assert_eq!(hits.len(), 1, "an authoritative page bought its way in");
+    assert_eq!(hits[0].uri, "doc://relevant");
+}
+
+#[test]
+fn ranks_survive_a_write_and_read() {
+    let mut builder = two_equal_pages();
+    builder.set_rank(DocId(1), 0.75);
+    let segment = Segment::from_bytes(builder.encode()).unwrap();
+    let meta = segment.doc(DocId(1)).expect("doc 1");
+    assert!(
+        (meta.rank - 0.75).abs() < 1e-6,
+        "rank came back as {}",
+        meta.rank
+    );
+    assert!((segment.doc(DocId(0)).unwrap().rank - 0.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn a_version_1_segment_is_refused_rather_than_misread() {
+    // The rank field changed the document store; an old segment read with the
+    // new parser would silently produce nonsense lengths and ranks.
+    let mut bytes = two_equal_pages().encode();
+    let len = bytes.len();
+    // The version sits just before the 4-byte magic at the very end.
+    bytes[len - 8..len - 4].copy_from_slice(&1u32.to_le_bytes());
+    let err = Segment::from_bytes(bytes).unwrap_err();
+    assert!(format!("{err}").contains("version"), "got {err}");
+}

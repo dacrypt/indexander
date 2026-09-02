@@ -583,6 +583,7 @@ dependencies = [
  "indexander-core",
  "indexander-crawl",
  "indexander-index",
+ "indexander-rank",
  "tokio",
  "url",
 ]
@@ -603,6 +604,13 @@ dependencies = [
 
 [[package]]
 name = "indexander-index"
+version = "0.1.0"
+dependencies = [
+ "indexander-core",
+]
+
+[[package]]
+name = "indexander-rank"
 version = "0.1.0"
 dependencies = [
  "indexander-core",

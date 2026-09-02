@@ -189,6 +189,10 @@ async fn worker(
 
         // Links are queued before the page is emitted, so the crawl keeps
         // moving even if the consumer is slow.
+        // Every outlink, resolved. These are collected even for links the
+        // frontier refuses to queue — an off-host link is still an edge in the
+        // graph, and PageRank flows along it whether or not we fetch the page.
+        let mut outlinks: Vec<String> = Vec::new();
         if !parsed.nofollow {
             let base = parsed
                 .base
@@ -198,6 +202,7 @@ async fn worker(
             let mut guard = shared.lock().await;
             for link in &parsed.links {
                 if let Some(target) = resolve(&base, &link.href) {
+                    outlinks.push(target.to_string());
                     guard.enqueue_link(target, pending.depth + 1, &link.text);
                 }
             }
@@ -215,6 +220,7 @@ async fn worker(
         };
         let mut document = Document::new(page.url.to_string(), title, parsed.text);
         document.anchors = anchors;
+        document.links = outlinks;
 
         shared.lock().await.stats.indexed += 1;
         if sink.send(document).await.is_err() {

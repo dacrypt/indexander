@@ -47,6 +47,12 @@ pub struct Document {
     /// This is the 2004 design's `anchor_queue` idea, kept: a page is often
     /// better described by how others link to it than by what it says.
     pub anchors: Vec<String>,
+    /// Absolute URLs this document links *to*.
+    ///
+    /// Not indexed. This is the raw material of the link graph, and therefore
+    /// of PageRank: the crawler is the only component that sees these, so it
+    /// has to carry them out.
+    pub links: Vec<String>,
 }
 
 impl Document {
@@ -57,6 +63,7 @@ impl Document {
             title: title.into(),
             body: body.into(),
             anchors: Vec::new(),
+            links: Vec::new(),
         }
     }
 

@@ -12,12 +12,15 @@ use std::process::ExitCode;
 
 use std::time::Duration;
 
+use indexander_core::DocId;
 use indexander_core::Document;
 use indexander_crawl::Config;
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::query;
 use indexander_index::search::search;
 use indexander_index::segment::Segment;
+use indexander_rank::graph::GraphBuilder;
+use indexander_rank::pagerank::{Options as RankOptions, pagerank};
 use url::Url;
 
 const USAGE: &str = "\
@@ -149,22 +152,32 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
     let started = std::time::Instant::now();
 
-    let (builder, stats) = runtime.block_on(async {
+    // The index is built as pages arrive, but PageRank cannot be: it needs the
+    // whole graph. So the crawl builds both, and the ranks are applied at the
+    // end, before the segment is written.
+    let (mut builder, graph_builder, stats) = runtime.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let crawling = indexander_crawl::crawl(&config, &seeds, tx);
         let indexing = async {
             let mut builder = SegmentBuilder::new();
+            let mut graph = GraphBuilder::new();
             while let Some(doc) = rx.recv().await {
                 if builder.document_count() % 25 == 0 && builder.document_count() > 0 {
                     println!("  {} pages...", builder.document_count());
                 }
+                graph.node(&doc.uri);
+                for link in &doc.links {
+                    graph.edge(&doc.uri, link);
+                }
                 builder.add(&doc);
             }
-            builder
+            (builder, graph)
         };
-        let (stats, builder) = tokio::join!(crawling, indexing);
-        stats.map(|s| (builder, s))
+        let (stats, (builder, graph)) = tokio::join!(crawling, indexing);
+        stats.map(|s| (builder, graph, s))
     })?;
+
+    apply_pagerank(&mut builder, graph_builder)?;
 
     builder
         .write_to(&out)
@@ -191,6 +204,47 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
         println!("{} url(s) failed to fetch", stats.errors);
     }
     println!("{} -> {}", out.display(), human_bytes(size));
+    Ok(())
+}
+
+/// Computes PageRank over the crawled graph and writes each score into the
+/// segment being built.
+///
+/// Separate from the crawl because it cannot start until the crawl is over:
+/// a page's authority depends on pages that may not have been fetched yet.
+fn apply_pagerank(builder: &mut SegmentBuilder, graph_builder: GraphBuilder) -> Result<(), String> {
+    let nodes = graph_builder.node_count();
+    let edges = graph_builder.edge_count();
+    let graph = graph_builder.build();
+    let options = RankOptions::default();
+    let ranks = pagerank(&graph, &options);
+
+    println!(
+        "link graph: {nodes} nodes, {edges} edges; pagerank {} in {} iteration{}",
+        if ranks.converged(&options) {
+            "converged"
+        } else {
+            "stopped early"
+        },
+        ranks.iterations,
+        if ranks.iterations == 1 { "" } else { "s" }
+    );
+
+    for i in 0..builder.document_count() {
+        let id = DocId(u32::try_from(i).map_err(|_| "too many documents")?);
+        if let Some(node) = builder.uri(id).and_then(|uri| graph.id(uri)) {
+            builder.set_rank(id, ranks.score(node));
+        }
+    }
+
+    let mut top = ranks.ranked();
+    top.truncate(5);
+    if !top.is_empty() {
+        println!("\nmost linked-to pages:");
+        for (node, score) in top {
+            println!("  {score:.5}  {}", graph.uri(node).unwrap_or("?"));
+        }
+    }
     Ok(())
 }
 

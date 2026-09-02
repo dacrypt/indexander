@@ -39,6 +39,10 @@ struct StoredDoc {
     uri: String,
     /// Token counts per field, for length normalisation.
     lengths: [u32; 3],
+    /// PageRank, or `1/n` when no link graph was computed. Stored rather than
+    /// recomputed because ranking a query must not depend on the whole graph
+    /// being in memory.
+    rank: f32,
 }
 
 /// Accumulates documents and produces a segment.
@@ -113,8 +117,23 @@ impl SegmentBuilder {
         self.docs.push(StoredDoc {
             uri: doc.uri.clone(),
             lengths,
+            rank: 0.0,
         });
         id
+    }
+
+    /// Sets a document's PageRank. Called after the crawl, once the link graph
+    /// is complete and the ranks have been computed over it.
+    pub fn set_rank(&mut self, id: DocId, rank: f32) {
+        if let Some(doc) = self.docs.get_mut(id.as_usize()) {
+            doc.rank = rank;
+        }
+    }
+
+    /// The uri of a document, so a caller can match ids to graph nodes.
+    #[must_use]
+    pub fn uri(&self, id: DocId) -> Option<&str> {
+        self.docs.get(id.as_usize()).map(|d| d.uri.as_str())
     }
 
     /// Serialises the segment. See `segment.rs` for the layout.
@@ -166,6 +185,10 @@ impl SegmentBuilder {
             for length in doc.lengths {
                 write_varint(u64::from(length), &mut out);
             }
+            // Raw f32 bits: ranks are tiny fractions, and a varint of a scaled
+            // integer would lose precision exactly where it matters, among the
+            // many pages whose ranks differ in the sixth decimal.
+            out.extend_from_slice(&doc.rank.to_le_bytes());
         }
 
         // --- term dictionary ------------------------------------------------

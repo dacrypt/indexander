@@ -22,6 +22,29 @@ use crate::segment::{Posting, Segment};
 const K1: f32 = 1.2;
 /// Length normalisation: how much a long document is penalised. 0 disables it.
 const B: f32 = 0.75;
+/// How much authority is allowed to move a result.
+///
+/// Relevance decides *whether* a page can appear; authority decides the order
+/// among pages that already match. This is why the boost multiplies BM25
+/// rather than being added to it: a page about nothing cannot buy its way in
+/// with links, however many it has.
+const AUTHORITY_WEIGHT: f32 = 0.5;
+
+/// Turns a PageRank into a multiplier around 1.0.
+///
+/// `rank * n` is the page's rank relative to the average page, so an ordinary
+/// page sits at 1.0 and gets no boost. The logarithm is what keeps a page that
+/// is a thousand times more central from being a thousand times higher: in a
+/// real web graph ranks span many orders of magnitude, and without it
+/// authority would simply overwrite relevance.
+fn authority(rank: f32, total_docs: usize) -> f32 {
+    if rank <= 0.0 {
+        return 1.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let relative = rank * total_docs as f32;
+    1.0 + AUTHORITY_WEIGHT * relative.max(0.0).ln_1p()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -177,6 +200,10 @@ pub fn search(segment: &Segment, query: &Query, limit: usize) -> Result<Vec<Hit>
             score += *term_idf * (tf * (K1 + 1.0)) / (tf + K1 * length_norm);
         }
 
+        // Authority scales relevance; it never creates it. A document that
+        // scored zero on the query still scores zero.
+        score *= authority(meta.rank, total_docs);
+
         heap.push(Ranked(score, doc));
         if heap.len() > limit {
             heap.pop();
@@ -247,5 +274,32 @@ mod tests {
     #[test]
     fn idf_stays_positive_for_a_term_in_every_document() {
         assert!(idf(100, 100) > 0.0);
+    }
+
+    #[test]
+    fn an_average_page_gets_no_authority_boost() {
+        // rank == 1/n is the average, so relative == 1 and ln_1p(1) is small
+        // but the point is that it is bounded and the same for every page.
+        assert!((authority(0.0, 100) - 1.0).abs() < f32::EPSILON);
+        assert!(authority(0.01, 100) > 1.0);
+    }
+
+    #[test]
+    fn authority_is_logarithmic_not_linear() {
+        // A page a thousand times more central is not a thousand times better.
+        let ordinary = authority(0.001, 1000);
+        let central = authority(1.0, 1000);
+        assert!(central > ordinary);
+        assert!(
+            central < ordinary * 20.0,
+            "a 1000x rank produced a {}x score change",
+            central / ordinary
+        );
+    }
+
+    #[test]
+    fn a_missing_rank_is_neutral() {
+        // Indexes built before v2, or without a crawl, have rank 0.
+        assert!((authority(0.0, 1) - 1.0).abs() < f32::EPSILON);
     }
 }
