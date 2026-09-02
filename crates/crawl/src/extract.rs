@@ -125,10 +125,12 @@ pub fn extract(html: &str) -> Extracted {
             ("meta", false) => {
                 let is_robots =
                     attribute(tag, "name").is_some_and(|n| n.eq_ignore_ascii_case("robots"));
-                if is_robots && let Some(content) = attribute(tag, "content") {
-                    let content = content.to_ascii_lowercase();
-                    out.noindex |= content.contains("noindex") || content.contains("none");
-                    out.nofollow |= content.contains("nofollow") || content.contains("none");
+                if is_robots {
+                    if let Some(content) = attribute(tag, "content") {
+                        let content = content.to_ascii_lowercase();
+                        out.noindex |= content.contains("noindex") || content.contains("none");
+                        out.nofollow |= content.contains("nofollow") || content.contains("none");
+                    }
                 }
             }
             ("a", false) => {

@@ -99,14 +99,14 @@ impl Robots {
                             }
                         })
                         .max();
-                    if let Some(specificity) = specificity
-                        && best.as_ref().is_none_or(|(b, _, _)| specificity >= *b)
-                    {
-                        best = Some((
-                            specificity,
-                            std::mem::take(&mut current_rules),
-                            current_delay,
-                        ));
+                    if let Some(specificity) = specificity {
+                        if best.as_ref().is_none_or(|(b, _, _)| specificity >= *b) {
+                            best = Some((
+                                specificity,
+                                std::mem::take(&mut current_rules),
+                                current_delay,
+                            ));
+                        }
                     }
                 }
                 current_agents.clear();
@@ -149,11 +149,10 @@ impl Robots {
                 }
                 "crawl-delay" => {
                     in_rules = true;
-                    if let Ok(seconds) = value.parse::<f64>()
-                        && seconds.is_finite()
-                        && seconds >= 0.0
-                    {
-                        current_delay = Some(Duration::from_secs_f64(seconds.min(300.0)));
+                    if let Ok(seconds) = value.parse::<f64>() {
+                        if seconds.is_finite() && seconds >= 0.0 {
+                            current_delay = Some(Duration::from_secs_f64(seconds.min(300.0)));
+                        }
                     }
                 }
                 // Sitemaps are global, not part of any group.

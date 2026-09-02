@@ -1,0 +1,3 @@
+# Keep clippy honest about the MSRV declared in Cargo.toml: without this it
+# suggests idioms that do not compile on the oldest supported compiler.
+msrv = "1.85.0"

@@ -56,11 +56,11 @@ pub fn resolve(base: &Url, href: &str) -> Option<Url> {
 
     // Hosts are case-insensitive; the `url` crate already lowercases them, but
     // a trailing dot is a distinct string for the same host.
-    if let Some(host) = url.host_str()
-        && let Some(trimmed) = host.strip_suffix('.')
-    {
-        let trimmed = trimmed.to_owned();
-        url.set_host(Some(&trimmed)).ok()?;
+    if let Some(host) = url.host_str() {
+        if let Some(trimmed) = host.strip_suffix('.') {
+            let trimmed = trimmed.to_owned();
+            url.set_host(Some(&trimmed)).ok()?;
+        }
     }
 
     strip_tracking(&mut url);
