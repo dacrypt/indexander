@@ -252,7 +252,16 @@ pub fn decode_entities(text: &str) -> String {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
         // An entity is at most a few characters; beyond that it is a stray `&`.
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        //
+        // The window has to end on a character boundary before it can be a
+        // slice index. Twelve *bytes* into `&gt; if you’re` lands inside the
+        // apostrophe, and slicing there panics - which is a crash on any real
+        // page that writes an entity near an accent, so most of them.
+        let mut window = rest.len().min(12);
+        while !rest.is_char_boundary(window) {
+            window -= 1;
+        }
+        let Some(end) = rest[..window].find(';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -386,6 +395,34 @@ fn named_latin1(name: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_entity_next_to_a_multibyte_character_does_not_panic() {
+        // Straight from the Rust Book, which crashed the extractor: the
+        // twelve-byte search window for the closing `;` ended inside the
+        // typographic apostrophe.
+        let text = "&gt; if you\u{2019}re calling the method";
+        assert_eq!(
+            decode_entities(text),
+            "> if you\u{2019}re calling the method"
+        );
+
+        // The same shape with the multi-byte character at every offset the
+        // window could land on, which is the general form of the bug.
+        for pad in 0..16 {
+            let input = format!("&{}\u{1F44E}x", "a".repeat(pad));
+            let _ = decode_entities(&input);
+        }
+    }
+
+    #[test]
+    fn a_stray_ampersand_survives_beside_an_emoji() {
+        assert_eq!(decode_entities("a & \u{1F44E} b"), "a & \u{1F44E} b");
+        assert_eq!(
+            decode_entities("\u{1F44E}&amp;\u{1F44E}"),
+            "\u{1F44E}&\u{1F44E}"
+        );
+    }
 
     #[test]
     fn title_and_text_come_out_separately() {

@@ -328,6 +328,62 @@ known-item measures whether an engine can find a document from its own words,
 and that is not the same quantity as relevance. The documentation above said so
 before there was any way to check. There is now.
 
+
+## Was an HTML parser worth writing?
+
+The README listed "a real HTML parser" as missing, on the strength of a poor
+score over the Rust documentation. Before writing one, the question was split
+in two and measured.
+
+Two corpora of local HTML: the prose books (`book`, `reference`,
+`rust-by-example` — 1,381 pages of English) and the `std` API docs (2,466
+generated pages). Both were indexed twice, once raw and once through the
+extractor the crawler already has, and asked the same known-item questions —
+spans drawn from the *extracted* prose in both cases, because a span of real
+text also appears verbatim in the markup, so neither index gets a question the
+other cannot answer.
+
+| corpus | raw HTML | extracted | seeds agreeing |
+|---|---|---|---|
+| prose books | 0.365 / 0.337 / 0.431 | **0.469 / 0.447 / 0.521** | 3 of 3 |
+| `std` API docs | 0.448 / 0.459 | **0.512 / 0.518** | 2 of 2 |
+
+Extracting is worth about 0.10 MRR on prose and 0.06 on generated docs, which
+is unsurprising once the corpus is measured rather than guessed at: **86.7% of
+the tokens in those files are markup.** The real text is buried in a document
+six times longer than itself, and BM25 divides by length.
+
+### But that is not the question that was asked
+
+That measures *extracting at all*, and the code to do it already existed — it
+was simply never wired into the path that indexes files. It is now.
+
+Whether the existing scanner needs replacing by a real parser is a different
+question, and the same measurement answers it: **no evidence that it does.**
+Counting how much markup survives extraction, `div` appears in 21 of 1,381
+documents and `px` in 2 — and those are chapters that discuss HTML. The scanner
+is not leaking tags.
+
+What it does leak is more interesting, and shows up as fifteen terms appearing
+in exactly 1,288 documents each: `search`, `navigate`, `shortcuts`, `press`,
+`hide`, `ayu`, `navy`, `coal`. That is mdBook's navigation chrome and theme
+picker, and it is *real text inside real elements*. A better parser would
+extract it just as faithfully. Removing it is boilerplate detection — noticing
+that a block repeats across a site — which is a different problem, and at
+roughly 4% of tokens after extraction, a smaller one than it looks.
+
+So: the cheap thing was measured, justified and built. The expensive thing was
+measured and not built.
+
+### One thing the measurement found that nobody was looking for
+
+The extractor panicked on the first real page it was pointed at.
+`decode_entities` looked twelve *bytes* ahead for the closing `;` of an entity,
+and twelve bytes into `&gt; if you’re` lands inside the apostrophe. Any page
+writing an entity within a dozen bytes of an accent would have crashed the
+crawler, which is most pages in most languages. It has a test now, and the test
+was watched failing.
+
 ## What these numbers are not
 
 **Comparable to anyone else's.** Different corpus, different queries, different

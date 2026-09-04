@@ -347,8 +347,10 @@ fn terms_of(path: &Path, from: Source) -> Option<Vec<String>> {
             if is_binary(&raw) {
                 return None;
             }
+            // Through the same extractor the indexer used, or the questions
+            // would be asked in markup the index no longer contains.
             Some(
-                tokenizer::tokenize(&decode(raw))
+                tokenizer::tokenize(&crate::body_of(path, decode(raw)))
                     .into_iter()
                     .map(|t| t.text)
                     .collect(),

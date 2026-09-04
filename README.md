@@ -39,7 +39,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 16 µs to 144 µs over 7,661 documents, warm; the older 103k-document figures elsewhere in this file were measured under the intersection semantics that bare terms no longer have |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.258 MAP and 0.844 success@10 on Cranfield's human judgements; 0.557 MRR on known-item queries |
-| Tests | 374, including full crawls and eight-shard queries over real sockets |
+| Tests | 379, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -733,10 +733,13 @@ Stated plainly, because a README that only lists what works is a sales page:
   index is a third of the text it indexes, so this is a decision waiting on
   someone who needs it rather than an oversight.
 - **An HTTP API and a UI.** There is a CLI and a library.
-- **A real HTML parser.** `crates/crawl/src/extract.rs` is a scanner, not a
-  parser: it walks the bytes once and never builds a tree. It handles the
-  malformed markup it has been shown, and every case has a test, but a
-  `html5ever`-grade tokenizer would handle more.
+- **Boilerplate detection.** Extracting text from HTML leaves the parts of a
+  page that are not about anything: navigation, theme pickers, footers. On the
+  Rust books, fifteen such terms appear in exactly 1,288 documents each. A
+  better HTML parser would not help — that text is real text in real elements —
+  and it was measured at roughly 4% of tokens, so this is on the list rather
+  than urgent. [docs/EVALUATION.md](docs/EVALUATION.md) has the numbers, and
+  why a `html5ever`-grade parser was measured and then not written.
 - **Crawl state that survives a restart.** The frontier is in memory, so a
   crawl that stops starts over.
 
