@@ -337,6 +337,10 @@ impl SegmentBuilder {
         }
 
         // --- footer ---------------------------------------------------------
+        // Everything written so far is what the digest covers: the footer
+        // carries it and therefore cannot be part of it.
+        let digest = crate::segment::digest_of(&out);
+
         let footer_start = out.len();
         for value in [
             postings_offset,
@@ -348,6 +352,7 @@ impl SegmentBuilder {
         ] {
             out.extend_from_slice(&value.to_le_bytes());
         }
+        out.extend_from_slice(&digest.to_le_bytes());
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(MAGIC);
         debug_assert_eq!(out.len() - footer_start, FOOTER_LEN);

@@ -64,6 +64,15 @@ pub enum Request {
     RankApply { global_dangling: f32 },
     /// Give me your ranks; the run is over.
     RankResults,
+    /// What segment are you serving, and how big is it?
+    ///
+    /// The digest is what makes a copy checkable: a replica that fetched the
+    /// bytes and got a different digest fetched something else.
+    SegmentInfo,
+    /// Send me `len` bytes of your segment starting at `offset`.
+    ///
+    /// Chunked because a segment is hundreds of megabytes and a frame is not.
+    SegmentChunk { offset: u64, len: u32 },
     /// May I make `permits` requests to `host`?
     ///
     /// Sent to whichever node owns that host's rate limit, which is a
@@ -100,6 +109,15 @@ pub enum Response {
         permits: usize,
         /// The gap to leave between the granted requests.
         spacing_ms: u64,
+    },
+    /// Answer to [`Request::SegmentInfo`].
+    SegmentInfo {
+        digest: u64,
+        len: u64,
+    },
+    /// Answer to [`Request::SegmentChunk`]. Shorter than asked for at the end.
+    SegmentChunk {
+        bytes: Vec<u8>,
     },
     /// Answer to [`Request::RankDangling`].
     RankDangling {
@@ -146,6 +164,8 @@ const REQ_RANK_EMIT: u8 = 7;
 const REQ_RANK_ABSORB: u8 = 8;
 const REQ_RANK_APPLY: u8 = 9;
 const REQ_RANK_RESULTS: u8 = 10;
+const REQ_SEGMENT_INFO: u8 = 11;
+const REQ_SEGMENT_CHUNK: u8 = 12;
 
 const RES_TERM_STATS: u8 = 1;
 const RES_HITS: u8 = 2;
@@ -157,6 +177,8 @@ const RES_RANK_BOUNDARIES: u8 = 7;
 const RES_RANK_ROUND: u8 = 8;
 const RES_RANK_RESULTS: u8 = 9;
 const RES_OK: u8 = 10;
+const RES_SEGMENT_INFO: u8 = 11;
+const RES_SEGMENT_CHUNK: u8 = 12;
 
 impl Request {
     #[must_use]
@@ -224,6 +246,12 @@ impl Request {
                 w.f32(*global_dangling);
             }
             Self::RankResults => w.u8(REQ_RANK_RESULTS),
+            Self::SegmentInfo => w.u8(REQ_SEGMENT_INFO),
+            Self::SegmentChunk { offset, len } => {
+                w.u8(REQ_SEGMENT_CHUNK);
+                w.varint(*offset);
+                w.varint(u64::from(*len));
+            }
         }
         w.finish()
     }
@@ -283,6 +311,12 @@ impl Request {
                 global_dangling: r.f32()?,
             },
             REQ_RANK_RESULTS => Self::RankResults,
+            REQ_SEGMENT_INFO => Self::SegmentInfo,
+            REQ_SEGMENT_CHUNK => Self::SegmentChunk {
+                offset: r.varint()?,
+                len: u32::try_from(r.varint()?)
+                    .map_err(|_| indexander_core::Error::Corrupt("chunk too large".into()))?,
+            },
             tag => {
                 return Err(indexander_core::Error::Corrupt(format!(
                     "unknown request tag {tag}"
@@ -366,6 +400,16 @@ impl Response {
                     w.f32(*score);
                 }
             }
+            Self::SegmentInfo { digest, len } => {
+                w.u8(RES_SEGMENT_INFO);
+                w.varint(*digest);
+                w.varint(*len);
+            }
+            Self::SegmentChunk { bytes } => {
+                w.u8(RES_SEGMENT_CHUNK);
+                w.usize(bytes.len());
+                w.bytes(bytes);
+            }
             Self::Ok => w.u8(RES_OK),
             Self::Error { message } => {
                 w.u8(RES_ERROR);
@@ -440,6 +484,16 @@ impl Response {
                 }
                 Self::RankResults { ranks }
             }
+            RES_SEGMENT_INFO => Self::SegmentInfo {
+                digest: r.varint()?,
+                len: r.varint()?,
+            },
+            RES_SEGMENT_CHUNK => {
+                let len = r.count()?;
+                Self::SegmentChunk {
+                    bytes: r.bytes(len)?,
+                }
+            }
             RES_OK => Self::Ok,
             RES_ERROR => Self::Error {
                 message: r.string()?,
@@ -480,6 +534,11 @@ mod tests {
         });
         roundtrip_request(&Request::RankApply {
             global_dangling: 0.125,
+        });
+        roundtrip_request(&Request::SegmentInfo);
+        roundtrip_request(&Request::SegmentChunk {
+            offset: 1 << 40,
+            len: 65536,
         });
         roundtrip_request(&Request::RankDangling);
         roundtrip_request(&Request::RankEmit);
@@ -526,6 +585,14 @@ mod tests {
                 spacing_ms: 500,
             },
             Response::Ok,
+            Response::SegmentInfo {
+                digest: 0xdead_beef_cafe_f00d,
+                len: 260_000_000,
+            },
+            Response::SegmentChunk {
+                bytes: vec![0u8, 255, 7, 0, 0, 42],
+            },
+            Response::SegmentChunk { bytes: Vec::new() },
             Response::RankDangling { dangling: 0.0625 },
             Response::RankRound {
                 dangling: 0.5,

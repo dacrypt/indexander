@@ -24,6 +24,12 @@ use crate::frame::{read_frame, read_hello, write_frame, write_hello};
 /// but framing.
 #[must_use]
 pub fn handle(segment: &Segment, request: &Request) -> Response {
+    // Serving a copy of the segment is a different job from answering
+    // queries about it, and lives in `replication`. It shares this socket
+    // because a replica pulls from whichever node already has the data.
+    if let Some(response) = crate::replication::handle(segment.as_bytes(), segment, request) {
+        return response;
+    }
     match request {
         Request::TermStats { terms } => {
             let doc_freq = terms
@@ -73,6 +79,10 @@ pub fn handle(segment: &Segment, request: &Request) -> Response {
         // would believe it had a partition of the graph that is not here.
         Request::Lease { .. } => Response::Error {
             message: "a shard does not grant fetch leases".to_owned(),
+        },
+        // Handled above.
+        Request::SegmentInfo | Request::SegmentChunk { .. } => Response::Error {
+            message: "unreachable: handled by replication".to_owned(),
         },
         Request::RankInit { .. }
         | Request::RankDangling

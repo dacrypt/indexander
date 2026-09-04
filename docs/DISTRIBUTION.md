@@ -171,6 +171,22 @@ piece, not the hardest:
 Keeping the mutable metadata tiny and the data immutable is what lets the
 storage layer be boring, and the storage layer should be boring.
 
+**A copy is not a replica until it has been checked.** Segments carry a digest
+in their footer, written when the segment is built and free to read back. A
+transfer that reports success is not evidence: the file is written under a
+temporary name, read back from disk, digested, and only renamed into place if
+it matches. The failure being defended against is not an attacker — anyone who
+can rewrite a segment can rewrite its footer — but a truncated stream, a full
+disk or a flipped bit, each of which produces a file that opens, parses, and
+answers queries with documents quietly missing.
+
+**A dead replica is not a dead shard, and the difference is deliberate.**
+Losing a shard still fails the query, because a fifth of the corpus silently
+absent is worse than an error. Losing one *copy* of a shard does not, because
+another copy holds the same segment and the answer is the same answer rather
+than a quieter one. A shard whose every replica is unreachable fails, and the
+error names every address that was tried.
+
 ## Order of work
 
 1. ~~Split the single process into `coordinator` and `shard` roles that talk
@@ -189,7 +205,11 @@ storage layer be boring, and the storage layer should be boring.
    `crates/cluster/src/ranking.rs`. Splitting a graph across up to 17 shards
    in process, or 5 over real sockets, gives the same ranks and the same
    *order* as computing it in one.
-5. Replication and merge scheduling.
+5. **Replication done; merge scheduling not.** `crates/cluster/src/replication.rs`
+   copies a segment between nodes and refuses a copy whose digest does not
+   match, and `Coordinator::connect_replicated` falls over to another replica
+   of a shard. Segment merging, and the small consistent store holding which
+   segments make up a shard, are still to do.
 
 Step 1 is most of the value: it is what stops the single-process assumption
 from being baked into another year of code.

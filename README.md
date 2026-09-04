@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 244, including full crawls and eight-shard queries over real sockets |
+| Tests | 255, including full crawls and eight-shard queries over real sockets |
 | Memory | 32 MB resident to serve a 236 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -263,11 +263,24 @@ so a misconfigured crawler cannot talk the cluster into hammering a site. And
 if the authority disappears, a crawl falls back to its own delay rather than
 stalling — a stopped crawl is worse than a slower one.
 
-### A missing shard fails the query
+### A missing shard fails the query; a missing replica does not
 
 Results computed from four shards out of five are not slightly worse results;
 they are results that silently omit a fifth of the corpus. The coordinator
 refuses to connect rather than degrade.
+
+Replication is what makes the other half true. `connect_replicated` takes the
+replicas of each shard and tries them in order, so one copy being down changes
+nothing about the answer — while a shard whose copies are *all* down still
+fails, naming every address it tried.
+
+Copying a segment is easy because segments never change: written once, never
+modified, so a copy needs no lock and no version. What it does need is
+checking. Every segment carries a digest in its footer, and a transfer writes
+under a temporary name, reads the file back, digests it, and renames it into
+place only if it matches. A transfer that reports success is not evidence —
+a truncated stream or a full disk produces a file that opens, parses, and
+answers queries with documents quietly missing.
 
 ## How it works
 
@@ -438,8 +451,9 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **Replication.** Segments are immutable files, which makes this the easy
-  part, and it is not done. Step 5.
+- **Segment merging.** One segment per index still. Real corpora need many,
+  written incrementally and merged in the background — and a small consistent
+  store holding which segments make up a shard.
 - **A shared `robots.txt` cache.** The lease authority paces requests but does
   not fetch `robots.txt`, so each node still makes that one request per host.
 - **Segment merging.** One segment per index today. Real corpora need many,

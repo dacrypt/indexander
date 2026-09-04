@@ -65,11 +65,14 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Connects to every address, failing if any one of them cannot be reached.
+    /// Connects to one address per shard.
     ///
     /// Failing rather than degrading is the right default for a search engine:
     /// results computed from four shards out of five are not "slightly worse
     /// results", they are results that silently omit a fifth of the corpus.
+    ///
+    /// See [`Coordinator::connect_replicated`] when a shard has more than one
+    /// copy — then a dead address is not a dead shard.
     pub async fn connect(addresses: &[String]) -> Result<Self> {
         // Connecting is itself fanned out: with fifty shards, doing it one at
         // a time makes startup fifty round trips deep.
@@ -96,6 +99,57 @@ impl Coordinator {
             return Err(Error::Corrupt(
                 "a coordinator needs at least one shard".into(),
             ));
+        }
+        Ok(Self { shards })
+    }
+
+    /// Connects to one live replica of each shard.
+    ///
+    /// Each entry is the replicas of one shard, tried in order. This is the
+    /// distinction replication buys, and it is worth being precise about:
+    /// a missing *shard* still fails the query, because a fifth of the corpus
+    /// would be silently absent; a missing *replica* does not, because another
+    /// copy holds the same segment and the answer is the same one.
+    ///
+    /// A shard whose replicas are all unreachable fails the whole connection,
+    /// with every address it tried, rather than quietly returning results from
+    /// the rest.
+    pub async fn connect_replicated(replicas: &[Vec<String>]) -> Result<Self> {
+        if replicas.is_empty() {
+            return Err(Error::Corrupt(
+                "a coordinator needs at least one shard".into(),
+            ));
+        }
+
+        // Shards are tried concurrently; the replicas within a shard are tried
+        // in order, because the first live one is the answer and racing them
+        // would open connections nobody uses.
+        let attempts: Vec<_> = replicas
+            .iter()
+            .map(|group| {
+                let group = group.clone();
+                tokio::spawn(async move {
+                    let mut failures = Vec::new();
+                    for address in &group {
+                        match ShardConnection::connect(address).await {
+                            Ok(connection) => return Ok(connection),
+                            Err(e) => failures.push(format!("{address}: {e}")),
+                        }
+                    }
+                    Err(Error::Corrupt(format!(
+                        "every replica of a shard is unreachable ({})",
+                        failures.join("; ")
+                    )))
+                })
+            })
+            .collect();
+
+        let mut shards = Vec::with_capacity(replicas.len());
+        for attempt in attempts {
+            let connection = attempt
+                .await
+                .map_err(|e| Error::Corrupt(format!("connect task failed: {e}")))??;
+            shards.push(Arc::new(Mutex::new(connection)));
         }
         Ok(Self { shards })
     }

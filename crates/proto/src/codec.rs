@@ -53,6 +53,11 @@ impl Writer {
         self.buf.extend_from_slice(&value.to_le_bytes());
     }
 
+    /// Raw bytes, length written by the caller.
+    pub fn bytes(&mut self, value: &[u8]) {
+        self.buf.extend_from_slice(value);
+    }
+
     pub fn str(&mut self, value: &str) {
         self.varint(value.len() as u64);
         self.buf.extend_from_slice(value.as_bytes());
@@ -126,6 +131,11 @@ impl<'a> Reader<'a> {
             .try_into()
             .map_err(|_| Error::Corrupt("truncated f32".into()))?;
         Ok(f32::from_le_bytes(bytes))
+    }
+
+    /// Reads `len` raw bytes.
+    pub fn bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+        Ok(self.take(len)?.to_vec())
     }
 
     pub fn string(&mut self) -> Result<String> {

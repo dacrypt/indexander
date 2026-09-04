@@ -479,3 +479,66 @@ fn opening_a_missing_or_corrupt_file_errors() {
     assert!(Segment::open(&path).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// --- digests and replicas ------------------------------------------------
+
+#[test]
+fn the_same_corpus_produces_the_same_digest() {
+    // What makes a replica checkable: build it twice, get the same segment.
+    let a = Segment::from_bytes(build_whole_corpus()).unwrap();
+    let b = Segment::from_bytes(build_whole_corpus()).unwrap();
+    assert_eq!(a.digest(), b.digest());
+    assert!(a.verify());
+}
+
+#[test]
+fn a_different_corpus_produces_a_different_digest() {
+    let a = Segment::from_bytes(build_whole_corpus()).unwrap();
+    let mut extra = Builder::new();
+    for doc in &corpus() {
+        extra.add(doc);
+    }
+    extra.add(&Document::new("doc://extra", "otro", "un documento mas"));
+    let b = Segment::from_bytes(extra.encode()).unwrap();
+    assert_ne!(a.digest(), b.digest());
+}
+
+#[test]
+fn verify_catches_a_flipped_bit() {
+    // The failure a replica has to survive: bytes arrived, but not all of
+    // them are the ones that were sent.
+    let mut bytes = build_whole_corpus();
+    // Somewhere in the postings, well clear of the footer.
+    bytes[64] ^= 0x01;
+    let segment = Segment::from_bytes(bytes).unwrap();
+    assert!(
+        !segment.verify(),
+        "a corrupt segment reported itself intact"
+    );
+}
+
+#[test]
+fn verify_catches_appended_or_removed_padding() {
+    // Length is mixed into the digest, so trailing bytes cannot be added or
+    // taken away unnoticed. Tested at the body's end rather than the file's,
+    // because the footer is not part of what the digest covers.
+    let bytes = build_whole_corpus();
+    let mut padded = bytes.clone();
+    let footer_at = padded.len() - 60;
+    padded.splice(footer_at..footer_at, std::iter::repeat_n(0u8, 8));
+    let segment = Segment::from_bytes(padded);
+    // Either it fails to parse, or it parses and fails to verify. Both are
+    // detections; silently serving it would not be.
+    match segment {
+        Err(_) => {}
+        Ok(s) => assert!(!s.verify(), "padded segment reported itself intact"),
+    }
+}
+
+fn build_whole_corpus() -> Vec<u8> {
+    let mut builder = Builder::new();
+    for doc in &corpus() {
+        builder.add(doc);
+    }
+    builder.encode()
+}

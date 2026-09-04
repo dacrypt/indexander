@@ -40,15 +40,15 @@ use indexander_core::{DocId, Error, Field, Position, Result};
 use crate::codec::{read_deltas, read_varint};
 
 pub(crate) const MAGIC: &[u8; 4] = b"IXDR";
-pub(crate) const VERSION: u32 = 5;
+pub(crate) const VERSION: u32 = 6;
 /// Postings per skip block.
 ///
 /// Small enough that decoding one block to find a document is cheap; large
 /// enough that the skip index stays a small fraction of the postings. 128 is
 /// the number every implementation of this lands on, for the same reasons.
 pub(crate) const SKIP_INTERVAL: usize = 128;
-/// Six u64 offsets, a u32 version, a 4-byte magic.
-pub(crate) const FOOTER_LEN: usize = 6 * 8 + 4 + 4;
+/// Six u64 offsets, a u64 digest, a u32 version, a 4-byte magic.
+pub(crate) const FOOTER_LEN: usize = 6 * 8 + 8 + 4 + 4;
 
 /// One term's appearance in one field of one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +145,7 @@ impl std::ops::Deref for Backing {
 #[derive(Debug)]
 pub struct Segment {
     bytes: Backing,
+    digest: u64,
     postings_offset: usize,
     term_dict_offset: usize,
     term_offsets_offset: usize,
@@ -218,6 +219,7 @@ impl Segment {
         let read_u64 = |i: usize| -> usize {
             u64::from_le_bytes(footer[i * 8..i * 8 + 8].try_into().expect("8 bytes")) as usize
         };
+        let digest = u64::from_le_bytes(footer[6 * 8..7 * 8].try_into().expect("8 bytes"));
         let postings_offset = read_u64(0);
         let doc_store_offset = read_u64(1);
         let term_dict_offset = read_u64(2);
@@ -246,6 +248,7 @@ impl Segment {
 
         Ok(Self {
             bytes,
+            digest,
             postings_offset,
             term_dict_offset,
             term_offsets_offset,
@@ -291,6 +294,43 @@ impl Segment {
             });
         }
         Ok(docs)
+    }
+
+    /// The segment's raw bytes, exactly as they are on disk.
+    ///
+    /// Exposed so a node can serve a copy of itself to a replica without the
+    /// replication code needing to know anything about the format. Reading
+    /// them all touches every page of a memory-mapped segment, which is fine
+    /// for a transfer and would not be for a query.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The digest recorded when this segment was written.
+    ///
+    /// Reading it is free — it sits in the footer. Two segments with the same
+    /// digest are the same segment, which is what makes a replica checkable
+    /// rather than assumed.
+    #[must_use]
+    pub fn digest(&self) -> u64 {
+        self.digest
+    }
+
+    /// Recomputes the digest over the actual bytes and compares.
+    ///
+    /// Not done on open: a 248 MB segment is memory mapped precisely so that
+    /// a query touches a few pages, and hashing it would touch all of them.
+    /// This is for after a transfer, when the question is whether what
+    /// arrived is what was sent.
+    ///
+    /// It detects corruption, not tampering. Anyone who can rewrite a segment
+    /// can rewrite its footer, and defending against that is a different
+    /// problem needing a different tool.
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        let body = self.bytes.len().saturating_sub(FOOTER_LEN);
+        digest_of(&self.bytes[..body]) == self.digest
     }
 
     #[must_use]
@@ -493,6 +533,43 @@ impl Segment {
         }
         Ok(out)
     }
+}
+
+/// A 64-bit digest of a segment's contents.
+///
+/// FNV-1a with an avalanche step at the end: fast enough to run over a
+/// quarter of a gigabyte without thinking about it, and good enough to catch
+/// a truncated transfer, a flipped bit or a half-written file. It is not a
+/// cryptographic hash and is not used as one.
+///
+/// # Panics
+///
+/// Never: the only `expect` is on a slice `chunks_exact(8)` has already
+/// guaranteed is eight bytes long.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn digest_of(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // Eight bytes at a time: the compiler turns this into far fewer
+    // instructions than a byte-at-a-time loop, and the mixing is the same.
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        hash ^= word;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    for byte in chunks.remainder() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    // Length is mixed in so that trailing zeroes cannot be added or removed
+    // without changing the digest.
+    hash ^= bytes.len() as u64;
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^ (hash >> 33)
 }
 
 /// How a term's postings are laid out: how many documents, where the body
