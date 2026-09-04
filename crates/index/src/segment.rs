@@ -40,7 +40,13 @@ use indexander_core::{DocId, Error, Field, Position, Result};
 use crate::codec::{read_deltas, read_varint};
 
 pub(crate) const MAGIC: &[u8; 4] = b"IXDR";
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
+/// Postings per skip block.
+///
+/// Small enough that decoding one block to find a document is cheap; large
+/// enough that the skip index stays a small fraction of the postings. 128 is
+/// the number every implementation of this lands on, for the same reasons.
+pub(crate) const SKIP_INTERVAL: usize = 128;
 /// Six u64 offsets, a u32 version, a 4-byte magic.
 pub(crate) const FOOTER_LEN: usize = 6 * 8 + 4 + 4;
 
@@ -367,19 +373,74 @@ impl Segment {
         self.decode_postings(term, false)
     }
 
-    fn decode_postings(&self, term: &str, want_positions: bool) -> Result<Vec<Posting>> {
+    /// Reads a term's header: where its postings body starts and where each
+    /// skip block begins.
+    fn term_blocks(&self, term: &str) -> Result<Option<TermLayout>> {
         let Some((offset, _)) = self.lookup(term)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let mut cursor = self.postings_offset.max(offset);
         let doc_count = read_varint(&self.bytes, &mut cursor)? as usize;
+        let block_count = read_varint(&self.bytes, &mut cursor)? as usize;
+
+        let mut blocks = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            let first_doc = u32::try_from(read_varint(&self.bytes, &mut cursor)?)
+                .map_err(|_| Error::Corrupt("block start exceeds u32".into()))?;
+            let at = read_varint(&self.bytes, &mut cursor)? as usize;
+            blocks.push((first_doc, at));
+        }
+        // Offsets in the header are relative to the body, which begins here.
+        let body = cursor;
+        for (_, at) in &mut blocks {
+            *at += body;
+            if *at > self.bytes.len() {
+                return Err(Error::Corrupt("skip offset runs past end".into()));
+            }
+        }
+        Ok(Some((doc_count, body, blocks)))
+    }
+
+    /// A cursor over `term`'s postings that can skip forward.
+    pub fn cursor(&self, term: &str, want_positions: bool) -> Result<PostingsCursor<'_>> {
+        let Some((doc_count, body, blocks)) = self.term_blocks(term)? else {
+            return Ok(PostingsCursor::empty(self));
+        };
+        let mut cursor = PostingsCursor {
+            segment: self,
+            doc_count,
+            blocks,
+            want_positions,
+            at: body,
+            index: 0,
+            doc: 0,
+            fields: Vec::new(),
+            exhausted: doc_count == 0,
+        };
+        if doc_count > 0 {
+            cursor.read_here(true)?;
+        }
+        Ok(cursor)
+    }
+
+    fn decode_postings(&self, term: &str, want_positions: bool) -> Result<Vec<Posting>> {
+        let Some((doc_count, body, _)) = self.term_blocks(term)? else {
+            return Ok(Vec::new());
+        };
+        let mut cursor = body;
 
         let mut out = Vec::with_capacity(doc_count);
         let mut doc = 0u32;
         let mut positions = Vec::new();
-        for _ in 0..doc_count {
-            doc += u32::try_from(read_varint(&self.bytes, &mut cursor)?)
+        for position in 0..doc_count {
+            let value = u32::try_from(read_varint(&self.bytes, &mut cursor)?)
                 .map_err(|_| Error::Corrupt("document gap exceeds u32".into()))?;
+            // Every block restarts from an absolute id.
+            doc = if position % SKIP_INTERVAL == 0 {
+                value
+            } else {
+                doc + value
+            };
             let field_count = read_varint(&self.bytes, &mut cursor)? as usize;
             let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
@@ -423,5 +484,182 @@ impl Segment {
             });
         }
         Ok(out)
+    }
+}
+
+/// How a term's postings are laid out: how many documents, where the body
+/// starts, and `(first document, byte offset)` for each skip block.
+type TermLayout = (usize, usize, Vec<(u32, usize)>);
+
+/// A forward-only cursor over one term's postings, able to skip.
+///
+/// This is what makes intersecting a rare term with a common one cost the rare
+/// term. Decoding both lists in full and intersecting the results costs the
+/// common one — for a query like `kubernetes the`, that is a hundred thousand
+/// postings decoded to find a handful of documents that hold both.
+///
+/// [`seek`](PostingsCursor::seek) binary searches the skip index for the block
+/// that could contain the target and decodes forward from there, so the work
+/// is one block plus a logarithm rather than the whole list.
+#[derive(Debug)]
+pub struct PostingsCursor<'a> {
+    segment: &'a Segment,
+    doc_count: usize,
+    /// `(first document, absolute byte offset)` for each block.
+    blocks: Vec<(u32, usize)>,
+    want_positions: bool,
+    /// Byte offset of the posting the cursor is sitting on.
+    at: usize,
+    /// Its index within the term's postings.
+    index: usize,
+    doc: u32,
+    fields: Vec<FieldPosting>,
+    exhausted: bool,
+}
+
+impl<'a> PostingsCursor<'a> {
+    fn empty(segment: &'a Segment) -> Self {
+        Self {
+            segment,
+            doc_count: 0,
+            blocks: Vec::new(),
+            want_positions: false,
+            at: 0,
+            index: 0,
+            doc: 0,
+            fields: Vec::new(),
+            exhausted: true,
+        }
+    }
+
+    /// How many documents contain this term.
+    #[must_use]
+    pub fn document_frequency(&self) -> usize {
+        self.doc_count
+    }
+
+    /// The document the cursor is on, or `None` once it has run out.
+    #[must_use]
+    pub fn doc(&self) -> Option<DocId> {
+        if self.exhausted {
+            None
+        } else {
+            Some(DocId(self.doc))
+        }
+    }
+
+    /// The term's per-field counts and positions in the current document.
+    #[must_use]
+    pub fn fields(&self) -> &[FieldPosting] {
+        &self.fields
+    }
+
+    /// Where the term occurs in `field` in the current document.
+    #[must_use]
+    pub fn positions_in(&self, field: Field) -> &[Position] {
+        self.fields
+            .iter()
+            .find(|f| f.field == field)
+            .map_or(&[], |f| f.positions.as_slice())
+    }
+
+    /// Occurrences weighted by field, for the current document.
+    #[must_use]
+    pub fn weighted_frequency(&self) -> f32 {
+        self.fields
+            .iter()
+            .map(|f| f.field.weight() * f.count as f32)
+            .sum()
+    }
+
+    /// Advances to the next posting.
+    pub fn advance(&mut self) -> Result<()> {
+        if self.exhausted {
+            return Ok(());
+        }
+        self.index += 1;
+        if self.index >= self.doc_count {
+            self.exhausted = true;
+            return Ok(());
+        }
+        let starts_block = self.index % SKIP_INTERVAL == 0;
+        self.read_here(starts_block)
+    }
+
+    /// Moves to the first document at or after `target`.
+    ///
+    /// Never moves backwards: a cursor already past `target` stays where it
+    /// is, which is what lets callers leapfrog without tracking who is ahead.
+    pub fn seek(&mut self, target: DocId) -> Result<()> {
+        if self.exhausted || self.doc >= target.0 {
+            return Ok(());
+        }
+
+        // The last block whose first document is at or before the target. Its
+        // predecessor cannot hold the target, and its successor starts past it.
+        let candidate = self
+            .blocks
+            .partition_point(|(first, _)| *first <= target.0)
+            .saturating_sub(1);
+        let block_index = candidate * SKIP_INTERVAL;
+
+        // Only jump forward: the cursor may already be inside a later block.
+        if block_index > self.index {
+            let (first_doc, at) = self.blocks[candidate];
+            self.at = at;
+            self.index = block_index;
+            self.doc = first_doc;
+            self.read_here(true)?;
+        }
+
+        while !self.exhausted && self.doc < target.0 {
+            self.advance()?;
+        }
+        Ok(())
+    }
+
+    /// Decodes the posting at the current byte offset.
+    fn read_here(&mut self, absolute: bool) -> Result<()> {
+        let bytes = &*self.segment.bytes;
+        let mut cursor = self.at;
+
+        let value = u32::try_from(read_varint(bytes, &mut cursor)?)
+            .map_err(|_| Error::Corrupt("document gap exceeds u32".into()))?;
+        self.doc = if absolute { value } else { self.doc + value };
+
+        let field_count = read_varint(bytes, &mut cursor)? as usize;
+        self.fields.clear();
+        let mut positions = Vec::new();
+        for _ in 0..field_count {
+            let raw = *bytes
+                .get(cursor)
+                .ok_or_else(|| Error::Corrupt("postings end mid-field".into()))?;
+            cursor += 1;
+            let field = match raw {
+                0 => Field::Title,
+                1 => Field::Body,
+                2 => Field::Anchor,
+                other => return Err(Error::Corrupt(format!("unknown field tag {other}"))),
+            };
+            let count = read_varint(bytes, &mut cursor)? as usize;
+            let block_len = read_varint(bytes, &mut cursor)? as usize;
+            if self.want_positions {
+                read_deltas(bytes, &mut cursor, count, &mut positions)?;
+            } else {
+                cursor = cursor
+                    .checked_add(block_len)
+                    .filter(|c| *c <= bytes.len())
+                    .ok_or_else(|| Error::Corrupt("position block runs past end".into()))?;
+                positions.clear();
+            }
+            self.fields.push(FieldPosting {
+                field,
+                count: u32::try_from(count)
+                    .map_err(|_| Error::Corrupt("term frequency exceeds u32".into()))?,
+                positions: std::mem::take(&mut positions),
+            });
+        }
+        self.at = cursor;
+        Ok(())
     }
 }

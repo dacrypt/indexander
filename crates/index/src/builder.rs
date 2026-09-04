@@ -17,7 +17,7 @@ use std::path::Path;
 use indexander_core::{DocId, Document, Field, Position, Result};
 
 use crate::codec::{write_deltas, write_varint};
-use crate::segment::{FOOTER_LEN, MAGIC, VERSION};
+use crate::segment::{FOOTER_LEN, MAGIC, SKIP_INTERVAL, VERSION};
 use crate::tokenizer::tokenize_into;
 
 /// Where one term occurs inside one document, per field.
@@ -182,21 +182,39 @@ impl SegmentBuilder {
             let offset = out.len() as u64;
             write_varint(docs.len() as u64, &mut out);
 
+            // Postings are written in blocks with a skip index in front, so a
+            // query can jump to the block that might hold the document it is
+            // looking for instead of decoding everything before it. Without
+            // this, intersecting a rare term with a common one costs the
+            // common term's entire list, however few documents match both.
+            //
+            // Each block starts with an absolute document id rather than a
+            // delta, which is what makes it independently decodable and so
+            // what makes jumping to it possible at all.
+            let mut body: Vec<u8> = Vec::new();
+            let mut blocks: Vec<(u32, u64)> = Vec::new();
             let mut previous_doc = 0u32;
-            for (doc_id, occurrences) in docs {
-                write_varint(u64::from(doc_id.0 - previous_doc), &mut out);
+
+            for (position, (doc_id, occurrences)) in docs.iter().enumerate() {
+                if position % SKIP_INTERVAL == 0 {
+                    blocks.push((doc_id.0, body.len() as u64));
+                    write_varint(u64::from(doc_id.0), &mut body);
+                } else {
+                    write_varint(u64::from(doc_id.0 - previous_doc), &mut body);
+                }
                 previous_doc = doc_id.0;
+                let out = &mut body;
 
                 let present = occurrences
                     .fields
                     .iter()
                     .enumerate()
                     .filter(|(_, f)| !f.positions.is_empty());
-                write_varint(present.clone().count() as u64, &mut out);
+                write_varint(present.clone().count() as u64, out);
 
                 for (field_index, field) in present {
                     out.push(field_index as u8);
-                    write_varint(field.positions.len() as u64, &mut out);
+                    write_varint(field.positions.len() as u64, out);
 
                     // The byte length of the position block, so a reader that
                     // does not want positions can jump the whole thing with an
@@ -205,10 +223,17 @@ impl SegmentBuilder {
                     // most of the index on any query without a phrase.
                     let mut positions = Vec::new();
                     write_deltas(&field.positions, &mut positions);
-                    write_varint(positions.len() as u64, &mut out);
+                    write_varint(positions.len() as u64, out);
                     out.extend_from_slice(&positions);
                 }
             }
+
+            write_varint(blocks.len() as u64, &mut out);
+            for (first_doc, at) in &blocks {
+                write_varint(u64::from(*first_doc), &mut out);
+                write_varint(*at, &mut out);
+            }
+            out.extend_from_slice(&body);
             term_meta.push((offset, docs.len() as u64));
         }
 

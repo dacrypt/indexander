@@ -175,6 +175,13 @@ pub fn search_with_stats(
     // only a phrase query ever reads them. Deciding once, here, is worth more
     // than any amount of cleverness further down.
     let need_positions = !query.phrases.is_empty();
+
+    // Without phrases, the whole query can be answered by leapfrogging
+    // cursors, which never decodes a posting it does not need. With phrases,
+    // positions are needed anyway, so the straightforward path is used.
+    if !need_positions {
+        return leapfrog(segment, query, limit, global, total_docs);
+    }
     let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
     for term in query.scoring_terms() {
         let list = if need_positions {
@@ -263,6 +270,126 @@ pub fn search_with_stats(
             score,
         })
         .collect())
+}
+
+/// Answers a phrase-free query by advancing cursors in step.
+///
+/// Every term is a cursor. The rarest one leads: it proposes a document, the
+/// others skip forward to it, and either they all agree — a match, scored on
+/// the spot — or the highest one becomes the new proposal. No cursor ever
+/// decodes a posting behind the pivot, so intersecting `kubernetes` with `the`
+/// costs roughly what `kubernetes` costs, instead of what `the` costs.
+///
+/// This is the difference between a query that scales with the rarest term in
+/// it and one that scales with the commonest.
+fn leapfrog(
+    segment: &Segment,
+    query: &Query,
+    limit: usize,
+    global: Option<&GlobalStats>,
+    total_docs: usize,
+) -> Result<Vec<Hit>> {
+    let terms = query.scoring_terms();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Rarest first: the shortest list drives, and a term absent from the
+    // segment means nothing can match.
+    let mut cursors = Vec::with_capacity(terms.len());
+    for term in &terms {
+        let cursor = segment.cursor(term, false)?;
+        if cursor.doc().is_none() {
+            return Ok(Vec::new());
+        }
+        let doc_freq = global
+            .and_then(|g| g.doc_freq.get(term).copied())
+            .unwrap_or_else(|| cursor.document_frequency());
+        cursors.push((idf(total_docs, doc_freq), cursor));
+    }
+    cursors.sort_by_key(|(_, c)| c.document_frequency());
+
+    // Excluded terms get cursors too, so exclusion is a skip rather than a
+    // scan of the excluded term's entire list.
+    let mut excluded = Vec::with_capacity(query.excluded.len());
+    for term in &query.excluded {
+        excluded.push(segment.cursor(term, false)?);
+    }
+
+    let average_length = segment.average_document_length().max(1.0);
+    let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
+
+    while let Some(mut pivot) = cursors[0].1.doc() {
+        // Bring everyone to the pivot, raising it whenever someone overshoots.
+        let mut aligned = true;
+        for (_, cursor) in &mut cursors[1..] {
+            cursor.seek(pivot)?;
+            match cursor.doc() {
+                None => return Ok(finish(heap, segment, limit)),
+                Some(doc) if doc != pivot => {
+                    pivot = doc;
+                    aligned = false;
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        if !aligned {
+            cursors[0].1.seek(pivot)?;
+            continue;
+        }
+
+        // Every term is on `pivot`. Is it excluded?
+        let mut dropped = false;
+        for cursor in &mut excluded {
+            cursor.seek(pivot)?;
+            if cursor.doc() == Some(pivot) {
+                dropped = true;
+                break;
+            }
+        }
+
+        if !dropped {
+            if let Some(meta) = segment.doc(pivot) {
+                let length_norm = 1.0 - B + B * (meta.total_length() as f32 / average_length);
+                // Summed in the cursors' order, which is by document frequency
+                // and then by term - deterministic, so scores are reproducible.
+                let mut score = 0.0f32;
+                for (term_idf, cursor) in &cursors {
+                    let tf = cursor.weighted_frequency();
+                    score += term_idf * (tf * (K1 + 1.0)) / (tf + K1 * length_norm);
+                }
+                score *= authority(meta.rank, total_docs);
+                heap.push(Ranked(score, pivot));
+                if heap.len() > limit {
+                    heap.pop();
+                }
+            }
+        }
+
+        cursors[0].1.advance()?;
+    }
+
+    Ok(finish(heap, segment, limit))
+}
+
+/// Drains a top-k heap into hits, best first.
+fn finish(heap: BinaryHeap<Ranked>, segment: &Segment, limit: usize) -> Vec<Hit> {
+    let mut ranked: Vec<Ranked> = heap.into_vec();
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    ranked.truncate(limit);
+    ranked
+        .into_iter()
+        .map(|Ranked(score, doc)| Hit {
+            doc,
+            uri: segment.doc(doc).map(|d| d.uri.clone()).unwrap_or_default(),
+            score,
+        })
+        .collect()
 }
 
 /// Narrows the corpus to the documents that can possibly match.

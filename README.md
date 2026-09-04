@@ -33,10 +33,10 @@ language and the ranking are real and tested end to end.
 | | |
 |---|---|
 | Indexing | 702 MiB of text into a 222 MiB index in 9.5–15.2 s on 14 threads, from 52.9–61.4 s on one |
-| Index size | 32–36% of the text it indexes, across three real corpora |
-| Query latency | 24 µs to 1.5 ms over 103,257 documents, by term frequency; 350 µs for a phrase |
+| Index size | 34% of the text it indexes |
+| Query latency | 24 µs to 570 µs over 103,257 documents; a four-term query, 170 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 187, including full crawls and eight-shard queries over real sockets |
+| Tests | 202, including full crawls and eight-shard queries over real sockets |
 | Memory | 32 MB resident to serve a 236 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -242,6 +242,28 @@ lets go, and a reader never sees a half-written file either.
 `rewriting_a_segment_does_not_disturb_an_open_one` maps a segment, replaces the
 file underneath it, and asserts both of those.
 
+**A query costs what its rarest term costs.** Postings are written in blocks of
+128 with a skip index in front, and a phrase-free query answers by leapfrogging
+cursors: the rarest term proposes a document, the others skip forward to it,
+and either they all agree — a match, scored on the spot — or the highest
+becomes the new proposal. No cursor ever decodes a posting behind the pivot.
+
+| query | decode everything | leapfrog |
+|---|---|---|
+| four terms, one in most documents | 1.45 ms | **0.17 ms** |
+| a rare term and the commonest term | — | **0.06 ms** |
+| the commonest term alone | 0.98 ms | **0.57 ms** |
+
+Intersecting `kubernetes` with `the` used to cost `the`'s hundred thousand
+postings to find the handful of documents holding both. Now it costs
+`kubernetes`. The skip index adds 2.6% to the index — 236.4 MiB to 242.5 MiB.
+
+Each block begins with an absolute document id rather than a delta, which is
+what makes it independently decodable and so what makes jumping to it possible
+at all. `seeking_to_every_document_lands_correctly` walks every possible target
+in a corpus; `leapfrog_finds_exactly_what_brute_force_finds` checks the whole
+path against the obvious implementation.
+
 **Positions are decoded only when something needs them.** Positions are the
 bulk of an index — a common term has one document gap and dozens of positions
 behind it — and only a phrase query ever reads them. Skipping them for every
@@ -332,9 +354,12 @@ Stated plainly, because a README that only lists what works is a sales page:
   to 5 of `docs/DISTRIBUTION.md`.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
-- **Skipping within a postings list.** A query still walks every posting of
-  every term. Block-max indexes let a scorer prove a whole block cannot reach
-  the current top-k and jump it.
+- **Block-max scoring.** Blocks are skipped when no document in them can
+  match; they are not yet skipped when no document in them can *score* high
+  enough to reach the current top-k. That needs a per-block score bound stored
+  alongside the skip index.
+- **The document store on disk.** The 32 MB a shard holds resident is every
+  document's URI, field lengths and rank, parsed up front.
 - **Concurrency.** Indexing is single threaded on a 14-core machine. The
   per-document work is independent; this is the largest easy win available.
 - **Snippets.** Positions are stored, so highlighted extracts are a query away.
