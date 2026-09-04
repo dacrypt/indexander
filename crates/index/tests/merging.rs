@@ -316,3 +316,88 @@ fn terms_come_back_sorted_and_complete() {
     assert!(terms.iter().any(|t| t == "rust"));
     assert!(terms.iter().any(|t| t == "busqueda"));
 }
+
+// --- manifests -----------------------------------------------------------
+
+use indexander_index::manifest::{Entry, Manifest, Policy};
+
+#[test]
+fn an_index_opens_from_a_manifest_and_checks_the_digests() {
+    let dir = std::env::temp_dir().join(format!("indexander-manifest-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    let docs = corpus();
+    let mut manifest = Manifest::new();
+    for (i, chunk) in docs.chunks(40).enumerate() {
+        let mut builder = SegmentBuilder::new();
+        for doc in chunk {
+            builder.add(doc);
+        }
+        let name = format!("part{i}.ixdr");
+        builder.write_to(&dir.join(&name)).expect("write");
+        let segment = Segment::open(&dir.join(&name)).expect("open");
+        manifest.segments.push(Entry {
+            name,
+            digest: segment.digest(),
+            documents: segment.document_count(),
+            bytes: segment.as_bytes().len() as u64,
+        });
+    }
+
+    let path = dir.join("MANIFEST");
+    manifest.write_to(&path).expect("write manifest");
+    let read_back = Manifest::open(&path).expect("read manifest");
+    assert_eq!(read_back, manifest);
+
+    let index = Index::open_manifest(&dir, &read_back).expect("open index");
+    assert_eq!(index.document_count(), docs.len());
+    let whole = segment_of(&docs);
+    for text in QUERIES {
+        let parsed = query::parse(text);
+        assert_eq!(
+            uris(&index.search(&parsed, 10).expect("search")),
+            uris(&search(&whole, &parsed, 10).expect("search")),
+            "an index opened from a manifest disagreed on {text:?}"
+        );
+    }
+
+    // A manifest whose digest does not match the file on disk is refused.
+    let mut wrong = read_back.clone();
+    wrong.segments[0].digest ^= 1;
+    assert!(Index::open_manifest(&dir, &wrong).is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn merging_a_plan_matches_merging_by_hand() {
+    let index = split(6);
+    let policy = Policy {
+        segments_per_tier: 2,
+        tier_factor: 1_000_000,
+        ..Policy::default()
+    };
+    // Everything lands in one tier, so the plan is the first two segments.
+    let manifest = Manifest {
+        segments: index
+            .segments()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Entry {
+                name: format!("{i}.ixdr"),
+                digest: s.digest(),
+                documents: s.document_count(),
+                bytes: s.as_bytes().len() as u64,
+            })
+            .collect(),
+    };
+    let plan = policy.next_merge(&manifest).expect("a merge");
+    assert!(plan.len() >= 2);
+
+    let merged = Segment::from_bytes(index.merge_plan(&plan).expect("merge")).expect("segment");
+    let expected: usize = plan
+        .iter()
+        .map(|i| index.segments()[*i].document_count())
+        .sum();
+    assert_eq!(merged.document_count(), expected);
+}

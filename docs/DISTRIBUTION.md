@@ -215,10 +215,11 @@ error names every address that was tried.
 5. **Replication done; merge scheduling not.** `crates/cluster/src/replication.rs`
    copies a segment between nodes and refuses a copy whose digest does not
    match, and `Coordinator::connect_replicated` falls over to another replica
-   of a shard. Segment merging is built too — `Index::merge` folds several
-   segments into exactly the segment a single pass would have written. What is
-   still missing is the *schedule*: what decides when to merge, and the small
-   consistent store recording which segments make up a shard.
+   of a shard. Segment merging is built — `Index::merge` folds several segments
+   into exactly the segment a single pass would have written — and so is the
+   manifest that records which segments make up an index and the tiered policy
+   that decides what to fold next. What is missing is the daemon that runs them
+   on a schedule and replicates a new manifest to a shard's other copies.
 
 Step 1 is most of the value: it is what stops the single-process assumption
 from being baked into another year of code.

@@ -19,6 +19,7 @@ use std::path::Path;
 use indexander_core::Result;
 
 use crate::builder::SegmentBuilder;
+use crate::manifest::Manifest;
 use crate::query::Query;
 use crate::search::{GlobalStats, Hit, search_with_stats};
 use crate::segment::Segment;
@@ -109,6 +110,37 @@ impl Index {
         crate::search::sort_hits(&mut all);
         all.truncate(limit);
         Ok(all)
+    }
+
+    /// Opens every segment a manifest names, from `directory`.
+    ///
+    /// Checks each one's digest against what the manifest recorded. A segment
+    /// that does not match is not a slightly different segment: it is a file
+    /// that will answer queries with documents quietly missing, which is
+    /// exactly what the digest is there to catch.
+    pub fn open_manifest(directory: &Path, manifest: &Manifest) -> Result<Self> {
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        for entry in &manifest.segments {
+            let segment = Segment::open(&directory.join(&entry.name))?;
+            if segment.digest() != entry.digest {
+                return Err(indexander_core::Error::Corrupt(format!(
+                    "{} does not match the digest the manifest recorded",
+                    entry.name
+                )));
+            }
+            segments.push(segment);
+        }
+        Ok(Self { segments })
+    }
+
+    /// Folds the segments a plan names into one, returning its bytes.
+    ///
+    /// The plan comes from [`Policy::next_merge`]; this only does what it
+    /// says. Deciding and doing are kept apart because deciding is cheap and
+    /// testable and doing is neither.
+    pub fn merge_plan(&self, plan: &[usize]) -> Result<Vec<u8>> {
+        let chosen: Vec<&Segment> = plan.iter().filter_map(|i| self.segments.get(*i)).collect();
+        Ok(SegmentBuilder::from_segments(&chosen)?.encode())
     }
 
     /// Folds every segment into one.

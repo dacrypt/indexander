@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 264, including full crawls and eight-shard queries over real sockets |
+| Tests | 282, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -216,6 +216,32 @@ proving nothing.
 Merging is byte-exact: `a_merge_produces_exactly_the_single_pass_segment` folds
 2, 3, 7 and 130 segments and gets the same bytes a single pass over the
 documents would have written.
+
+### When to merge
+
+Segments are immutable, so adding documents adds a segment. Left alone that
+ends badly in one of two ways: merge after every write and every document is
+rewritten every time, which is quadratic total work and an index that gets
+slower to build the bigger it is; never merge and a query opens thousands of
+files and sums statistics across all of them.
+
+Merging in *tiers* is the way out. A segment belongs to the tier of its size —
+an order of magnitude per tier — and a tier is folded into one segment once it
+holds eight of them, so a document is rewritten about once per tier it climbs.
+`total_work_is_linearithmic_not_quadratic` simulates ten thousand flushes and
+checks the bytes rewritten against both curves; `the_number_of_segments_stays_logarithmic`
+checks the other side of the same trade.
+
+Small tiers go first: merging the small segments is cheap and removes the most
+files per byte rewritten. A small segment is never folded into a huge one,
+which would rewrite the huge one to save a file.
+
+The manifest — which segments make up an index, and their digests — is the only
+mutable state in the whole store, and it is kilobytes of text. Text on purpose:
+"which segments make up this shard" is the question somebody asks at three in
+the morning, and answering it should not require this program to be working. It
+carries its own segment count, so a manifest that lost its last lines is
+refused rather than read as a smaller, valid index.
 
 ### Equal scores
 
@@ -476,7 +502,8 @@ Accents and case are folded the same way as at index time, so `Búsqueda`,
 ```
 crates/core    vocabulary: DocId, Document, Field, Error — no dependencies
 crates/index   tokenizer, codec, segment format, query parser, BM25 search,
-               and an index of several segments searched as one
+               an index of several segments searched as one, and the manifest
+               and merge policy that keep the number of them bounded
 crates/crawl   robots.txt, HTML extraction, URL normalisation, frontier, fetch
 crates/rank    the link graph as CSR, and PageRank over it
 crates/proto   the coordinator/shard wire protocol and shard routing
@@ -493,9 +520,9 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **A merge schedule, and the store that goes with it.** Merging works; what
-  decides *when* to merge, and the small consistent store recording which
-  segments make up a shard, do not exist.
+- **A background merger.** The policy decides what to merge and `Index` can
+  merge it; nothing yet runs the two on a schedule, or replicates a new
+  manifest to a shard's other copies.
 - **A shared `robots.txt` cache.** The lease authority paces requests but does
   not fetch `robots.txt`, so each node still makes that one request per host.
 - **Segment merging.** One segment per index today. Real corpora need many,
