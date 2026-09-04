@@ -416,6 +416,8 @@ impl Segment {
             doc: 0,
             fields: Vec::new(),
             exhausted: doc_count == 0,
+            decoded: 0,
+            jumps: 0,
         };
         if doc_count > 0 {
             cursor.read_here(true)?;
@@ -515,6 +517,11 @@ pub struct PostingsCursor<'a> {
     doc: u32,
     fields: Vec<FieldPosting>,
     exhausted: bool,
+    /// Postings actually decoded, and blocks jumped into. Diagnostics, and
+    /// the only way to answer "would skipping more blocks help?" with a
+    /// number instead of an opinion.
+    decoded: usize,
+    jumps: usize,
 }
 
 impl<'a> PostingsCursor<'a> {
@@ -529,7 +536,39 @@ impl<'a> PostingsCursor<'a> {
             doc: 0,
             fields: Vec::new(),
             exhausted: true,
+            decoded: 0,
+            jumps: 0,
         }
+    }
+
+    /// How many postings this cursor has decoded so far.
+    #[must_use]
+    pub fn decoded(&self) -> usize {
+        self.decoded
+    }
+
+    /// How many times it jumped to a block rather than walking to it.
+    #[must_use]
+    pub fn jumps(&self) -> usize {
+        self.jumps
+    }
+
+    /// Which skip block the cursor is currently inside.
+    #[must_use]
+    pub fn current_block(&self) -> usize {
+        self.index / SKIP_INTERVAL
+    }
+
+    /// How many skip blocks this term's postings occupy.
+    #[must_use]
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// The document each block starts at.
+    #[must_use]
+    pub fn block_starts(&self) -> &[(u32, usize)] {
+        &self.blocks
     }
 
     /// How many documents contain this term.
@@ -609,6 +648,7 @@ impl<'a> PostingsCursor<'a> {
             self.at = at;
             self.index = block_index;
             self.doc = first_doc;
+            self.jumps += 1;
             self.read_here(true)?;
         }
 
@@ -623,6 +663,7 @@ impl<'a> PostingsCursor<'a> {
         let bytes = &*self.segment.bytes;
         let mut cursor = self.at;
 
+        self.decoded += 1;
         let value = u32::try_from(read_varint(bytes, &mut cursor)?)
             .map_err(|_| Error::Corrupt("document gap exceeds u32".into()))?;
         self.doc = if absolute { value } else { self.doc + value };
