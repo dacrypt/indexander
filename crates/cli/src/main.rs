@@ -14,9 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use indexander_cluster::coordinator::Coordinator;
+use indexander_cluster::leases::LeaseAuthority;
 use indexander_core::DocId;
 use indexander_core::Document;
 use indexander_crawl::Config;
+use indexander_crawl::politeness::Politeness;
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::query;
 use indexander_index::search::search;
@@ -33,6 +35,7 @@ USAGE:
                               [--delay <ms>] [--concurrency <n>] [--any-host]
     indexander index <directory> [--out <segment>]
     indexander shard  --listen <addr> [--index <segment>]
+    indexander leases --listen <addr> [--floor <ms>]
     indexander search <query>... [--index <segment>] [--limit <n>]
                                  [--shards <addr,addr,...>]
     indexander stats [--index <segment>]
@@ -45,6 +48,8 @@ EXAMPLES:
     indexander search motor de busqueda
     indexander search '\"inverted index\"' -perl --limit 5
     indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
+    indexander leases --listen 127.0.0.1:7900 --floor 1000
+    indexander crawl https://example.com --leases 127.0.0.1:7900
     indexander search motor --shards 127.0.0.1:7801,127.0.0.1:7802
 ";
 
@@ -69,6 +74,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match command.as_str() {
         "crawl" => cmd_crawl(&args[1..]),
         "shard" => cmd_shard(&args[1..]),
+        "leases" => cmd_leases(&args[1..]),
         "index" => cmd_index(&args[1..]),
         "search" => cmd_search(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
@@ -110,6 +116,7 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     let (depth, rest) = take_option(&rest, "--depth");
     let (delay, rest) = take_option(&rest, "--delay");
     let (concurrency, rest) = take_option(&rest, "--concurrency");
+    let (leases, rest) = take_option(&rest, "--leases");
     let (any_host, seeds): (Vec<String>, Vec<String>) =
         rest.into_iter().partition(|a| a == "--any-host");
 
@@ -128,25 +135,13 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
         })
         .collect::<Result<_, _>>()?;
 
-    let parse_num = |value: Option<String>, name: &str, default: usize| -> Result<usize, String> {
-        value
-            .as_deref()
-            .map_or(Ok(default), str::parse)
-            .map_err(|_| format!("{name} needs a number"))
-    };
-
-    let mut config = Config::default();
-    config.limits.max_pages = parse_num(pages, "--pages", config.limits.max_pages)?;
-    config.limits.max_depth =
-        u32::try_from(parse_num(depth, "--depth", 3)?).map_err(|_| "--depth too large")?;
-    config.limits.max_pages_per_host = config.limits.max_pages;
-    config.limits.same_host_only = any_host.is_empty();
-    config.concurrency = parse_num(concurrency, "--concurrency", config.concurrency)?;
-    config.delay = Duration::from_millis(
-        parse_num(delay, "--delay", 500)?
-            .try_into()
-            .map_err(|_| "--delay too large")?,
-    );
+    let config = crawl_config(
+        pages.as_deref(),
+        depth.as_deref(),
+        delay.as_deref(),
+        concurrency.as_deref(),
+        any_host.is_empty(),
+    )?;
 
     let out = PathBuf::from(out.unwrap_or_else(|| DEFAULT_SEGMENT.to_owned()));
     println!(
@@ -163,8 +158,16 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     // whole graph. So the crawl builds both, and the ranks are applied at the
     // end, before the segment is written.
     let (mut builder, graph_builder, stats) = runtime.block_on(async {
+        let politeness = match &leases {
+            Some(address) => Arc::new(
+                indexander_cluster::leases::remote_politeness(address)
+                    .await
+                    .map_err(|e| format!("lease authority {address}: {e}"))?,
+            ),
+            None => Arc::new(Politeness::local(config.delay)),
+        };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let crawling = indexander_crawl::crawl(&config, &seeds, tx);
+        let crawling = indexander_crawl::crawl_with(&config, &seeds, tx, politeness);
         let indexing = async {
             let mut builder = SegmentBuilder::new();
             let mut graph = GraphBuilder::new();
@@ -321,6 +324,64 @@ fn search_cluster(addresses: &[String], query_text: &str, limit: usize) -> Resul
             connected
         );
         Ok(())
+    })
+}
+
+/// Turns the crawl command's numeric options into a config.
+fn crawl_config(
+    pages: Option<&str>,
+    depth: Option<&str>,
+    delay: Option<&str>,
+    concurrency: Option<&str>,
+    same_host_only: bool,
+) -> Result<Config, String> {
+    let parse_num = |value: Option<&str>, name: &str, default: usize| -> Result<usize, String> {
+        value
+            .map_or(Ok(default), str::parse)
+            .map_err(|_| format!("{name} needs a number"))
+    };
+
+    let mut config = Config::default();
+    config.limits.max_pages = parse_num(pages, "--pages", config.limits.max_pages)?;
+    config.limits.max_depth =
+        u32::try_from(parse_num(depth, "--depth", 3)?).map_err(|_| "--depth too large")?;
+    config.limits.max_pages_per_host = config.limits.max_pages;
+    config.limits.same_host_only = same_host_only;
+    config.concurrency = parse_num(concurrency, "--concurrency", config.concurrency)?;
+    config.delay = Duration::from_millis(
+        parse_num(delay, "--delay", 500)?
+            .try_into()
+            .map_err(|_| "--delay too large")?,
+    );
+    Ok(config)
+}
+
+/// Runs the node that owns a set of hosts' rate limits.
+///
+/// A crawl spread over several machines needs exactly one of these per host,
+/// or each machine paces itself and the site receives the sum. See
+/// `docs/DISTRIBUTION.md`.
+fn cmd_leases(args: &[String]) -> Result<(), String> {
+    let (listen, rest) = take_option(args, "--listen");
+    let (floor, _) = take_option(&rest, "--floor");
+    let listen = listen.ok_or_else(|| format!("leases needs --listen\n\n{USAGE}"))?;
+    let floor: u64 = floor
+        .as_deref()
+        .map_or(Ok(500), str::parse)
+        .map_err(|_| "--floor needs a number of milliseconds".to_owned())?;
+
+    println!("lease authority on {listen}, minimum {floor} ms between requests to a host");
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&listen)
+            .await
+            .map_err(|e| format!("binding {listen}: {e}"))?;
+        let authority = Arc::new(LeaseAuthority::new(Duration::from_millis(floor)));
+        authority
+            .serve(listener)
+            .await
+            .map_err(|e| format!("serving: {e}"))
     })
 }
 

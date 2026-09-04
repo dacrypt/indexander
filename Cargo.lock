@@ -594,6 +594,7 @@ name = "indexander-cluster"
 version = "0.1.0"
 dependencies = [
  "indexander-core",
+ "indexander-crawl",
  "indexander-index",
  "indexander-proto",
  "tokio",

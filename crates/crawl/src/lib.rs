@@ -18,11 +18,12 @@
 pub mod extract;
 pub mod frontier;
 pub mod normalize;
+pub mod politeness;
 pub mod robots;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use indexander_core::Document;
 use tokio::sync::{Mutex, mpsc};
@@ -30,6 +31,7 @@ use url::Url;
 
 use crate::frontier::{Frontier, Limits};
 use crate::normalize::{host_of, resolve};
+use crate::politeness::{Politeness, wait_for};
 use crate::robots::Robots;
 
 /// How the crawler behaves.
@@ -84,7 +86,6 @@ pub struct Stats {
 struct Shared {
     frontier: Frontier,
     robots: HashMap<String, Robots>,
-    next_allowed: HashMap<String, Instant>,
     stats: Stats,
 }
 
@@ -95,6 +96,26 @@ pub async fn crawl(
     config: &Config,
     seeds: &[Url],
     sink: mpsc::Sender<Document>,
+) -> Result<Stats, String> {
+    crawl_with(
+        config,
+        seeds,
+        sink,
+        Arc::new(Politeness::local(config.delay)),
+    )
+    .await
+}
+
+/// Crawls, asking `politeness` for permission before every request.
+///
+/// The single-node entry point above passes a local policy; a distributed
+/// crawl passes one that defers to whichever node owns each host's rate limit.
+/// Nothing below this line knows which it got.
+pub async fn crawl_with(
+    config: &Config,
+    seeds: &[Url],
+    sink: mpsc::Sender<Document>,
+    politeness: Arc<Politeness>,
 ) -> Result<Stats, String> {
     let client = reqwest::Client::builder()
         .user_agent(config.user_agent.clone())
@@ -111,7 +132,6 @@ pub async fn crawl(
     let shared = Arc::new(Mutex::new(Shared {
         frontier,
         robots: HashMap::new(),
-        next_allowed: HashMap::new(),
         stats: Stats::default(),
     }));
 
@@ -121,7 +141,8 @@ pub async fn crawl(
         let client = client.clone();
         let config = config.clone();
         let sink = sink.clone();
-        workers.spawn(async move { worker(&shared, &client, &config, &sink).await });
+        let politeness = Arc::clone(&politeness);
+        workers.spawn(async move { worker(&shared, &client, &config, &sink, &politeness).await });
     }
     while workers.join_next().await.is_some() {}
 
@@ -154,6 +175,7 @@ async fn worker(
     client: &reqwest::Client,
     config: &Config,
     sink: &mpsc::Sender<Document>,
+    politeness: &Politeness,
 ) {
     loop {
         let Some(pending) = shared.lock().await.frontier.next_url() else {
@@ -162,7 +184,8 @@ async fn worker(
         let host = host_of(&pending.url);
 
         // Ask this host's robots.txt once, before anything else.
-        let Some(rules) = ensure_robots(shared, client, config, &pending.url).await else {
+        let Some(rules) = ensure_robots(shared, client, config, &pending.url, politeness).await
+        else {
             continue;
         };
         let path_and_query = pending.url[url::Position::BeforePath..].to_owned();
@@ -171,7 +194,12 @@ async fn worker(
             continue;
         }
 
-        wait_turn(shared, &host, rules.crawl_delay().unwrap_or(config.delay)).await;
+        // One permit per page for now. Batching is the point of `permits`,
+        // and the frontier does not yet group a host's URLs to use it.
+        let lease = politeness
+            .lease(&host, rules.crawl_delay().unwrap_or(config.delay), 1)
+            .await;
+        wait_for(lease).await;
 
         let fetched = fetch(client, &pending.url, config.max_body_bytes).await;
         let Some(page) = fetched else {
@@ -242,6 +270,7 @@ async fn ensure_robots(
     client: &reqwest::Client,
     config: &Config,
     url: &Url,
+    politeness: &Politeness,
 ) -> Option<Robots> {
     let host = host_of(url);
     if let Some(cached) = shared.lock().await.robots.get(&host) {
@@ -253,7 +282,7 @@ async fn ensure_robots(
     robots_url.set_query(None);
 
     // robots.txt is itself a request to the host, so it waits its turn too.
-    wait_turn(shared, &host, config.delay).await;
+    wait_for(politeness.lease(&host, config.delay, 1).await).await;
 
     let rules = match client.get(robots_url).send().await {
         Ok(response) if response.status().is_success() => response.text().await.map_or_else(
@@ -268,27 +297,6 @@ async fn ensure_robots(
 
     shared.lock().await.robots.insert(host, rules.clone());
     Some(rules)
-}
-
-/// Blocks until this host may be contacted again, then reserves the next slot.
-async fn wait_turn(shared: &Arc<Mutex<Shared>>, host: &str, delay: Duration) {
-    let sleep_for = {
-        let mut guard = shared.lock().await;
-        let now = Instant::now();
-        let slot = guard
-            .next_allowed
-            .get(host)
-            .copied()
-            .filter(|t| *t > now)
-            .unwrap_or(now);
-        // Reserve while still holding the lock, so two workers cannot both
-        // decide it is their turn.
-        guard.next_allowed.insert(host.to_owned(), slot + delay);
-        slot.saturating_duration_since(now)
-    };
-    if !sleep_for.is_zero() {
-        tokio::time::sleep(sleep_for).await;
-    }
 }
 
 struct Page {

@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 212, including full crawls and eight-shard queries over real sockets |
+| Tests | 228, including full crawls and eight-shard queries over real sockets |
 | Memory | 32 MB resident to serve a 236 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -197,6 +197,36 @@ one shard ends up holding a hundred times what another does. The cost is that a
 site's pages scatter, which matters for crawl politeness — and that is solved
 with per-host fetch leases, described in `docs/DISTRIBUTION.md`, not by
 sharding differently.
+
+### Politeness belongs to one node per host
+
+A crawl sharded by URL scatters one host across every node, and each of them
+would independently conclude it is being polite. Five nodes at one request per
+second is five requests per second to a site that asked for one.
+
+So the rate limit for a host is owned by exactly one node — a **different**
+mapping from the one that owns its URLs — and every node asks it before
+fetching:
+
+```console
+$ indexander leases --listen 127.0.0.1:7910 --floor 300
+lease authority on 127.0.0.1:7910, minimum 300 ms between requests to a host
+
+$ indexander crawl https://example.com --leases 127.0.0.1:7910
+```
+
+The crawler asks a channel for permission and cannot tell whether the answer
+came from this process or from a socket, which is what keeps the single-node
+and distributed paths the same code.
+`a_local_policy_and_a_remote_one_behave_the_same` asserts exactly that, and
+`four_crawlers_sharing_an_authority_do_not_multiply_the_rate` is the test the
+design exists for: twelve requests from four independent crawlers arrive as one
+spaced sequence, not four.
+
+The authority grants the larger of what the crawler asks for and its own floor,
+so a misconfigured crawler cannot talk the cluster into hammering a site. And
+if the authority disappears, a crawl falls back to its own delay rather than
+stalling — a stopped crawl is worse than a slower one.
 
 ### A missing shard fails the query
 
@@ -373,10 +403,14 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **Distribution beyond step 1.** The roles, the protocol, the routing and the
-  two-round query exist. What does not: fetch leases so a multi-node crawl is
-  polite, distributed PageRank with boundary exchange, and replication. Steps 3
-  to 5 of `docs/DISTRIBUTION.md`.
+- **Distributed PageRank.** It is a global fixed point, so an iteration has to
+  exchange rank mass across shard boundaries and convergence has to be decided
+  globally. Step 4 of `docs/DISTRIBUTION.md`; today a crawl's graph is ranked
+  in one process.
+- **Replication.** Segments are immutable files, which makes this the easy
+  part, and it is not done. Step 5.
+- **A shared `robots.txt` cache.** The lease authority paces requests but does
+  not fetch `robots.txt`, so each node still makes that one request per host.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
 - **Block-max scoring.** Blocks are skipped when no document in them can

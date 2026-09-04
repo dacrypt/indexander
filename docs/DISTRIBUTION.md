@@ -58,9 +58,16 @@ url_owner        = shard_for(url)
 ```
 
 A node with a URL to fetch requests a **fetch lease** from the host's
-politeness owner, which hands out one lease per `crawl-delay` and caches that
-host's `robots.txt` for everyone. Leases are the only cross-node chatter in the
-crawl, they are small, and they batch: ask for twenty, fetch twenty.
+politeness owner. Leases are the only cross-node chatter in the crawl, they are
+small, and they batch: ask for twenty, fetch twenty.
+
+As built, the authority hands out slots and nothing else. It does not fetch
+`robots.txt` and does not know what a host asked for: the crawler supplies the
+delay it read from that host's `Crawl-delay`, and the authority grants the
+larger of that and its own floor. That keeps the authority free of an HTTP
+client, and it means a misconfigured crawler asking for no delay does not get
+no delay. What it does not yet do is share the `robots.txt` fetch, so each node
+still makes that one request per host itself.
 
 ## 3. Index: scatter, gather, and the score that does not compose
 
@@ -133,8 +140,11 @@ storage layer be boring, and the storage layer should be boring.
    `indexander shard` and `indexander search --shards` drive them.
 2. ~~Global term statistics, two-round.~~ **Done**, and tested both in-process
    and over sockets.
-3. Fetch leases, so a multi-node crawl is polite before there is a multi-node
-   crawl.
+3. ~~Fetch leases, so a multi-node crawl is polite before there is a
+   multi-node crawl.~~ **Done.** `indexander leases --listen <addr>` runs an
+   authority; `indexander crawl --leases <addr>` defers to it. The crawler
+   asks a channel and cannot tell whether the answer came from this process or
+   a socket, so a one-node crawl and a fifty-node crawl run the same code.
 4. Distributed PageRank with boundary exchange.
 5. Replication and merge scheduling.
 

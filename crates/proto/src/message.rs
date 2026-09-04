@@ -40,6 +40,18 @@ pub enum Request {
     },
     /// Diagnostics.
     Stats,
+    /// May I make `permits` requests to `host`?
+    ///
+    /// Sent to whichever node owns that host's rate limit, which is a
+    /// different mapping from the one that owns its URLs — see
+    /// `docs/DISTRIBUTION.md`.
+    Lease {
+        host: String,
+        /// The delay the asker believes the host wants, in milliseconds.
+        /// The authority may enforce more, never less.
+        requested_delay_ms: u64,
+        permits: usize,
+    },
 }
 
 /// What a shard answers.
@@ -57,6 +69,13 @@ pub enum Response {
         documents: usize,
         terms: usize,
         average_length: f32,
+    },
+    /// Permission granted, starting in `wait_ms` from now.
+    Lease {
+        wait_ms: u64,
+        permits: usize,
+        /// The gap to leave between the granted requests.
+        spacing_ms: u64,
     },
     /// The shard could not do what was asked. Carried rather than dropped so
     /// the coordinator can report which shard failed and why.
@@ -77,11 +96,13 @@ pub struct Hit {
 const REQ_TERM_STATS: u8 = 1;
 const REQ_SEARCH: u8 = 2;
 const REQ_STATS: u8 = 3;
+const REQ_LEASE: u8 = 4;
 
 const RES_TERM_STATS: u8 = 1;
 const RES_HITS: u8 = 2;
 const RES_STATS: u8 = 3;
 const RES_ERROR: u8 = 4;
+const RES_LEASE: u8 = 5;
 
 impl Request {
     #[must_use]
@@ -112,6 +133,16 @@ impl Request {
                 }
             }
             Self::Stats => w.u8(REQ_STATS),
+            Self::Lease {
+                host,
+                requested_delay_ms,
+                permits,
+            } => {
+                w.u8(REQ_LEASE);
+                w.str(host);
+                w.varint(*requested_delay_ms);
+                w.usize(*permits);
+            }
         }
         w.finish()
     }
@@ -145,6 +176,11 @@ impl Request {
                 }
             }
             REQ_STATS => Self::Stats,
+            REQ_LEASE => Self::Lease {
+                host: r.string()?,
+                requested_delay_ms: r.varint()?,
+                permits: r.usize()?,
+            },
             tag => {
                 return Err(indexander_core::Error::Corrupt(format!(
                     "unknown request tag {tag}"
@@ -190,6 +226,16 @@ impl Response {
                 w.usize(*terms);
                 w.f32(*average_length);
             }
+            Self::Lease {
+                wait_ms,
+                permits,
+                spacing_ms,
+            } => {
+                w.u8(RES_LEASE);
+                w.varint(*wait_ms);
+                w.usize(*permits);
+                w.varint(*spacing_ms);
+            }
             Self::Error { message } => {
                 w.u8(RES_ERROR);
                 w.str(message);
@@ -230,6 +276,11 @@ impl Response {
                 terms: r.usize()?,
                 average_length: r.f32()?,
             },
+            RES_LEASE => Self::Lease {
+                wait_ms: r.varint()?,
+                permits: r.usize()?,
+                spacing_ms: r.varint()?,
+            },
             RES_ERROR => Self::Error {
                 message: r.string()?,
             },
@@ -256,6 +307,11 @@ mod tests {
     #[test]
     fn every_request_roundtrips() {
         roundtrip_request(&Request::Stats);
+        roundtrip_request(&Request::Lease {
+            host: "example.com".into(),
+            requested_delay_ms: 500,
+            permits: 20,
+        });
         roundtrip_request(&Request::TermStats { terms: Vec::new() });
         roundtrip_request(&Request::TermStats {
             terms: vec!["motor".into(), "búsqueda".into()],
@@ -285,6 +341,11 @@ mod tests {
                 documents: 10,
                 terms: 20,
                 average_length: 33.5,
+            },
+            Response::Lease {
+                wait_ms: 1500,
+                permits: 20,
+                spacing_ms: 500,
             },
             Response::Error {
                 message: "no index loaded".into(),
