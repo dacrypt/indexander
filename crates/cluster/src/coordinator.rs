@@ -167,6 +167,12 @@ impl Coordinator {
         let mut total_docs = 0usize;
         let mut total_tokens = 0u64;
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
+        // Shards score locally and this merges the results, so two shards
+        // scoring by different formulas produce numbers that cannot be
+        // compared. That failure has no symptom - the query returns a ranking,
+        // just not a meaningful one - so it is checked here rather than
+        // trusted.
+        let mut agreed: Option<(String, [f32; 3])> = None;
 
         for (address, response) in self.broadcast(&request).await? {
             match response {
@@ -174,7 +180,24 @@ impl Coordinator {
                     doc_count,
                     total_length,
                     doc_freq: per_term,
+                    params,
                 } => {
+                    // Exact comparison on purpose: these are the same three
+                    // constants read from two segment footers, so shards that
+                    // agree agree bit for bit. A tolerance here would accept
+                    // parameters that are nearly the same and produce scores
+                    // that are not.
+                    #[allow(clippy::float_cmp)]
+                    match &agreed {
+                        None => agreed = Some((address.clone(), params)),
+                        Some((first, expected)) if *expected != params => {
+                            return Err(Error::Corrupt(format!(
+                                "shards disagree about scoring parameters: {first} has \
+                                 {expected:?}, {address} has {params:?}"
+                            )));
+                        }
+                        Some(_) => {}
+                    }
                     if per_term.len() != terms.len() {
                         return Err(Error::Corrupt(format!(
                             "shard {address} answered {} frequencies for {} terms",

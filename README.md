@@ -37,7 +37,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.557 MRR on known-item queries, and an ablation showing the number moves when the ranker is broken |
-| Tests | 342, including full crawls and eight-shard queries over real sockets |
+| Tests | 357, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -604,12 +604,29 @@ meant the right answer was one of forty identical copies. It now counts answers
 that scored *exactly* like other documents and says so before the figures are
 believed.
 
-Used on the ranker itself, the measurement says `K1` is worth nothing here
-(four values within 0.0006 of each other) and `B` is worth everything: full
+Used on the ranker itself, the measurement says `k1` is worth nothing here
+(four values within 0.0006 of each other) and `b` is worth everything: full
 length normalisation beats the textbook 0.75 by 0.087 MRR on this corpus, with
 a real peak rather than a runaway. The default has not been changed on the
 strength of one corpus — [docs/EVALUATION.md](docs/EVALUATION.md) says why, and
-what would change it.
+what would change it — but the knob is now reachable without a recompile:
+
+```console
+$ indexander index ~/corpus --b 1.0
+$ indexander stats
+scoring k1         1.200
+scoring b          1.000
+authority weight   0.500
+```
+
+The parameters live in the segment because that is where they have to live.
+Block-max bounds are computed with them when the segment is written, and a
+reader scoring by a different formula would be trusting bounds that do not
+bound it — which does not fail, it just quietly drops documents from the
+results. So a segment carries its own, a searcher uses the segment's and never
+its own defaults, and every place two segments could be mixed refuses when they
+disagree: merging them, searching an index containing both, and querying two
+shards that do not match.
 
 `indexander eval` is the other half, for when somebody has judged a collection:
 TREC topics and qrels in, P@k / nDCG@k / MAP / MRR out. It also prints how many
@@ -660,10 +677,6 @@ Stated plainly, because a README that only lists what works is a sales page:
 - **A judged collection.** Ranking is measured against known-item queries,
   which have one right answer and need no human. What documents are *about* is
   a harder question and needs judgements this repository does not have.
-- **Per-corpus scoring parameters.** `K1` and `B` are compile-time constants
-  because block-max bounds are computed with them at index time. Tuning them
-  per corpus — which the measurements say is worth 0.087 MRR — means storing
-  them in the segment and refusing to merge segments that disagree.
 - **Snippets.** Positions are stored, so highlighted extracts are a query away.
 - **An HTTP API and a UI.** There is a CLI and a library.
 - **A real HTML parser.** `crates/crawl/src/extract.rs` is a scanner, not a

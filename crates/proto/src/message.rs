@@ -122,6 +122,16 @@ pub enum Response {
         total_length: u64,
         /// Parallel to the requested terms, in the same order.
         doc_freq: Vec<usize>,
+        /// The scoring parameters this shard's segments were written with,
+        /// as `[k1, b, authority_weight]`.
+        ///
+        /// Shards score locally and the coordinator merges the results, so
+        /// two shards using different parameters produce numbers that cannot
+        /// be compared - a ranking assembled from them would be arbitrary
+        /// without being empty, which is the worst way for this to fail. The
+        /// coordinator checks these agree and refuses the query if they do
+        /// not.
+        params: [f32; 3],
     },
     Hits {
         hits: Vec<Hit>,
@@ -399,6 +409,10 @@ impl Request {
 }
 
 impl Response {
+    // One arm per variant, each a handful of lines. Splitting it would put the
+    // encoder and its decoder further apart, which is the pairing that has to
+    // stay readable together.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -407,6 +421,7 @@ impl Response {
                 doc_count,
                 total_length,
                 doc_freq,
+                params,
             } => {
                 w.u8(RES_TERM_STATS);
                 w.usize(*doc_count);
@@ -414,6 +429,9 @@ impl Response {
                 w.usize(doc_freq.len());
                 for freq in doc_freq {
                     w.usize(*freq);
+                }
+                for value in params {
+                    w.f32(*value);
                 }
             }
             Self::Hits { hits } => {
@@ -511,10 +529,12 @@ impl Response {
                 for _ in 0..count {
                     doc_freq.push(r.usize()?);
                 }
+                let params = [r.f32()?, r.f32()?, r.f32()?];
                 Self::TermStats {
                     doc_count,
                     total_length,
                     doc_freq,
+                    params,
                 }
             }
             RES_HITS => {
@@ -676,6 +696,7 @@ mod tests {
                 doc_count: 500,
                 total_length: 4_400_000,
                 doc_freq: vec![1, 2, 3],
+                params: [1.2, 0.75, 0.5],
             },
             Response::Hits {
                 hits: vec![Hit {

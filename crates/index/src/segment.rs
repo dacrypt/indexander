@@ -38,17 +38,23 @@ use std::path::Path;
 use indexander_core::{DocId, Error, Field, Position, Result};
 
 use crate::codec::{read_deltas, read_varint};
+use crate::scoring::Params;
 
 pub(crate) const MAGIC: &[u8; 4] = b"IXDR";
-pub(crate) const VERSION: u32 = 7;
+pub(crate) const VERSION: u32 = 8;
 /// Postings per skip block.
 ///
 /// Small enough that decoding one block to find a document is cheap; large
 /// enough that the skip index stays a small fraction of the postings. 128 is
 /// the number every implementation of this lands on, for the same reasons.
 pub(crate) const SKIP_INTERVAL: usize = 128;
-/// Nine u64 fields, a u64 digest, a u32 version, a 4-byte magic.
-pub(crate) const FOOTER_LEN: usize = 9 * 8 + 8 + 4 + 4;
+/// Nine u64 fields, a u64 digest, three f32 scoring parameters, a u32
+/// version, a 4-byte magic.
+///
+/// The parameters are here rather than compiled in because block-max bounds
+/// are computed with them when the segment is written. A reader that scored
+/// with different ones would be using bounds that do not bound anything.
+pub(crate) const FOOTER_LEN: usize = 9 * 8 + 8 + 3 * 4 + 4 + 4;
 /// Bytes per document in the lengths block: a `u32` length and an `f32` rank.
 const DOC_RECORD: usize = 8;
 
@@ -164,6 +170,8 @@ pub struct Segment {
     num_terms: usize,
     num_docs: usize,
     average_length: f32,
+    /// The scoring parameters this segment's bounds were computed with.
+    params: Params,
     /// Length and rank per document, read in at open.
     ///
     /// Deliberately *not* left on the mapping, unlike everything else here.
@@ -242,6 +250,22 @@ impl Segment {
             u64::from_le_bytes(footer[i * 8..i * 8 + 8].try_into().expect("8 bytes")) as usize
         };
         let digest = u64::from_le_bytes(footer[9 * 8..10 * 8].try_into().expect("8 bytes"));
+        let param_at = |i: usize| -> f32 {
+            let at = 10 * 8 + i * 4;
+            f32::from_le_bytes(footer[at..at + 4].try_into().expect("4 bytes"))
+        };
+        let params = Params {
+            k1: param_at(0),
+            b: param_at(1),
+            authority_weight: param_at(2),
+        };
+        if !params.is_usable() {
+            // A NaN here would make every score NaN, every comparison false,
+            // and the ranking arbitrary rather than absent. Refuse instead.
+            return Err(Error::Corrupt(format!(
+                "segment scoring parameters are not usable: {params:?}"
+            )));
+        }
 
         let postings_offset = read_u64(0);
         let doc_lengths_offset = read_u64(1);
@@ -304,6 +328,7 @@ impl Segment {
             num_terms,
             num_docs,
             average_length,
+            params,
             docs,
         })
     }
@@ -343,6 +368,15 @@ impl Segment {
     pub fn verify(&self) -> bool {
         let body = self.bytes.len().saturating_sub(FOOTER_LEN);
         digest_of(&self.bytes[..body]) == self.digest
+    }
+
+    /// The scoring parameters this segment was written with.
+    ///
+    /// A searcher must use these and not its own defaults: the block-max
+    /// bounds stored alongside every postings list were computed with them.
+    #[must_use]
+    pub fn params(&self) -> Params {
+        self.params
     }
 
     #[must_use]

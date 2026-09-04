@@ -16,11 +16,12 @@
 
 use std::path::Path;
 
-use indexander_core::Result;
+use indexander_core::{Error, Result};
 
 use crate::builder::SegmentBuilder;
 use crate::manifest::Manifest;
 use crate::query::Query;
+use crate::scoring::Params;
 use crate::search::{GlobalStats, Hit, search_with_stats};
 use crate::segment::Segment;
 
@@ -87,11 +88,41 @@ impl Index {
         Ok(stats)
     }
 
+    /// The scoring parameters every segment here was written with.
+    ///
+    /// An empty index has the defaults; it has no bounds that could disagree
+    /// with them.
+    ///
+    /// # Errors
+    ///
+    /// If the segments do not all agree. Their scores would be computed by
+    /// different formulas and ranking them against each other would produce an
+    /// order rather than an error, which is the failure worth refusing.
+    pub fn params(&self) -> Result<Params> {
+        let Some((first, rest)) = self.segments.split_first() else {
+            return Ok(Params::default());
+        };
+        let params = first.params();
+        match rest.iter().find(|s| s.params() != params) {
+            None => Ok(params),
+            Some(other) => Err(Error::Corrupt(format!(
+                "segments in this index were written with different scoring parameters: \
+                 {params:?} and {:?}",
+                other.params()
+            ))),
+        }
+    }
+
     /// Runs `query` across every segment and returns the global top `limit`.
+    ///
+    /// # Errors
+    ///
+    /// If the segments disagree about scoring parameters. See [`Self::params`].
     pub fn search(&self, query: &Query, limit: usize) -> Result<Vec<Hit>> {
         if self.segments.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        self.params()?;
         // One segment is the whole corpus, so its own counts are the right
         // ones and gathering statistics would only cost a pass.
         if self.segments.len() == 1 {

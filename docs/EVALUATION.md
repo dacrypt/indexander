@@ -199,13 +199,34 @@ what everyone gets. What would change it: the same result on a judged
 collection, where the thing being measured is relevance rather than
 findability.
 
-What the finding does justify is making the knob reachable. Today `K1` and `B`
-are compile-time constants, and they have to be, because block-max bounds are
-computed with them when a segment is written — a bound computed with a
-different formula than the one that scores queries is not a bound, it is a
-source of missing results. Per-corpus tuning means storing the parameters in
-the segment and refusing to merge segments that disagree. That is a format
-change, and it is the honest next step rather than a number quietly moved.
+What the finding does justify is making the knob reachable, and it now is:
+
+```bash
+indexander index ~/corpus --b 1.0
+```
+
+The parameters are written into the segment rather than compiled into the
+binary, because block-max bounds are computed with them when the segment is
+written. A reader scoring by a different formula would be trusting bounds that
+do not bound it, and that failure has no symptom — the query returns a ranking,
+with documents missing from it. So a searcher uses the segment's parameters and
+never its own defaults, and everywhere two segments could be mixed refuses when
+they disagree: `from_segments` will not merge them, an `Index` holding both will
+not search, and a coordinator whose shards do not match returns an error instead
+of a ranking assembled from two formulas.
+
+Segments written before this are version 7 and will not open. There is no
+migration: the parameters that produced their bounds were not recorded, so
+there is nothing to migrate them *to* — reindex.
+
+Measuring the knob through the knob, with no recompile between these two lines:
+
+```console
+$ indexander index ~/.cargo/registry/src/index.crates.io-* --out b075.ixdr
+$ indexander index ~/.cargo/registry/src/index.crates.io-* --out b100.ixdr --b 1.0
+$ indexander known-item ... --index b075.ixdr    MRR 0.5397  0.5724  0.5624
+$ indexander known-item ... --index b100.ixdr    MRR 0.6278  0.6407  0.6744
+```
 
 ## What these numbers are not
 

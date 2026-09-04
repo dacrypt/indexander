@@ -18,7 +18,7 @@ use indexander_core::{DocId, Document, Error, Field, Position, Result};
 
 use crate::segment::Segment;
 
-use crate::scoring::{authority, length_norm, saturation};
+use crate::scoring::Params;
 
 use crate::codec::{write_deltas, write_varint};
 use crate::segment::{FOOTER_LEN, MAGIC, SKIP_INTERVAL, VERSION};
@@ -68,6 +68,7 @@ fn posting_bound(
     meta: &StoredDoc,
     average_length: f32,
     doc_count: usize,
+    params: Params,
 ) -> f32 {
     let weighted: f32 = occurrences
         .fields
@@ -75,8 +76,8 @@ fn posting_bound(
         .enumerate()
         .map(|(i, f)| Field::ALL[i].weight() * f.positions.len() as f32)
         .sum();
-    let norm = length_norm(meta.length, average_length);
-    saturation(weighted, norm) * authority(meta.rank, doc_count)
+    let norm = params.length_norm(meta.length, average_length);
+    params.saturation(weighted, norm) * params.authority(meta.rank, doc_count)
 }
 
 /// Accumulates documents and produces a segment.
@@ -86,12 +87,33 @@ pub struct SegmentBuilder {
     /// term dictionary needs on disk — no separate sort pass.
     terms: BTreeMap<String, BTreeMap<DocId, DocOccurrences>>,
     docs: Vec<StoredDoc>,
+    /// What the bounds written into this segment will be computed with.
+    params: Params,
 }
 
 impl SegmentBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A builder that will score with `params` instead of the defaults.
+    ///
+    /// The choice is made here and nowhere else: the parameters are baked into
+    /// every block-max bound this builder writes, so changing them later would
+    /// mean rewriting the segment.
+    #[must_use]
+    pub fn with_params(params: Params) -> Self {
+        Self {
+            params,
+            ..Self::default()
+        }
+    }
+
+    /// The parameters this builder writes bounds with.
+    #[must_use]
+    pub fn params(&self) -> Params {
+        self.params
     }
 
     #[must_use]
@@ -182,8 +204,29 @@ impl SegmentBuilder {
     /// shifted the same way [`SegmentBuilder::absorb`] shifts them, so the
     /// result is exactly the segment a single pass over all the documents in
     /// that order would have produced.
+    /// # Errors
+    ///
+    /// If the segments were not all written with the same scoring parameters.
+    /// Merging them would have to pick one set and recompute every bound with
+    /// it, and a bound that disagrees with the scorer is a result that never
+    /// appears — so a merge that cannot be exact is refused instead of being
+    /// approximated.
     pub fn from_segments(segments: &[&Segment]) -> Result<Self> {
-        let mut builder = Self::new();
+        let params = match segments.split_first() {
+            None => Params::default(),
+            Some((first, rest)) => {
+                let params = first.params();
+                if let Some(other) = rest.iter().find(|s| s.params() != params) {
+                    return Err(Error::Corrupt(format!(
+                        "cannot merge segments written with different scoring parameters: \
+                         {params:?} and {:?}",
+                        other.params()
+                    )));
+                }
+                params
+            }
+        };
+        let mut builder = Self::with_params(params);
 
         for segment in segments {
             let shift = u32::try_from(builder.docs.len())
@@ -231,8 +274,17 @@ impl SegmentBuilder {
     ///
     /// # Panics
     ///
-    /// If the two builders together hold more than `u32::MAX` documents.
+    /// If the two builders together hold more than `u32::MAX` documents, or if
+    /// they disagree about scoring parameters. The second is a programming
+    /// error rather than bad input: both builders were made in this process,
+    /// and one of them was given parameters the other was not.
     pub fn absorb(&mut self, other: Self) {
+        assert!(
+            self.params == other.params,
+            "absorbing a builder with different scoring parameters: {:?} and {:?}",
+            self.params,
+            other.params
+        );
         let shift = u32::try_from(self.docs.len()).expect("more than u32::MAX documents");
 
         for (term, docs) in other.terms {
@@ -311,7 +363,8 @@ impl SegmentBuilder {
                 //
                 // Authority is folded in, because it multiplies the score.
                 if let Some(meta) = self.docs.get(doc_id.as_usize()) {
-                    let bound = posting_bound(occurrences, meta, average_length, doc_count);
+                    let bound =
+                        posting_bound(occurrences, meta, average_length, doc_count, self.params);
                     if let Some(last) = blocks.last_mut() {
                         last.2 = last.2.max(bound);
                     }
@@ -437,6 +490,9 @@ impl SegmentBuilder {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&digest.to_le_bytes());
+        out.extend_from_slice(&self.params.k1.to_le_bytes());
+        out.extend_from_slice(&self.params.b.to_le_bytes());
+        out.extend_from_slice(&self.params.authority_weight.to_le_bytes());
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(MAGIC);
         debug_assert_eq!(out.len() - footer_start, FOOTER_LEN);

@@ -135,6 +135,10 @@ pub fn handle(shard: &ShardIndex, request: &Request) -> Response {
                     .map(Segment::total_length)
                     .sum(),
                 doc_freq,
+                params: {
+                    let p = shard.index.params().unwrap_or_default();
+                    [p.k1, p.b, p.authority_weight]
+                },
             }
         }
         Request::Search {
@@ -317,6 +321,10 @@ mod tests {
                 doc_count: 2,
                 total_length: s.index().segments()[0].total_length(),
                 doc_freq: vec![2, 1, 0],
+                params: {
+                    let p = indexander_index::scoring::Params::default();
+                    [p.k1, p.b, p.authority_weight]
+                },
             }
         );
     }

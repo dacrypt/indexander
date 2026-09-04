@@ -16,7 +16,7 @@ use std::collections::{BinaryHeap, HashMap};
 use indexander_core::{DocId, Field, Result};
 
 use crate::query::Query;
-use crate::scoring::{authority, idf, length_norm, saturation};
+use crate::scoring::idf;
 use crate::segment::{Posting, Segment};
 
 /// Corpus-wide term statistics, supplied from outside.
@@ -190,6 +190,9 @@ pub fn search_with_stats(
             GlobalStats::average_length,
         )
         .max(1.0);
+    // The segment's own, never this build's defaults: the block-max bounds
+    // stored with every postings list were computed with these.
+    let params = segment.params();
     let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
 
     // Candidates ascend and so does every postings list, so the scorer walks
@@ -226,7 +229,7 @@ pub fn search_with_stats(
         let Some((length, rank)) = segment.doc_lengths(doc) else {
             continue;
         };
-        let length_norm = length_norm(length, average_length);
+        let length_norm = params.length_norm(length, average_length);
         let mut score = 0.0f32;
 
         for (term_idf, list, cursor) in &mut scorers {
@@ -237,12 +240,12 @@ pub fn search_with_stats(
                 continue;
             };
             let tf = posting.weighted_frequency();
-            score += *term_idf * saturation(tf, length_norm);
+            score += *term_idf * params.saturation(tf, length_norm);
         }
 
         // Authority scales relevance; it never creates it. A document that
         // scored zero on the query still scores zero.
-        score *= authority(rank, total_docs);
+        score *= params.authority(rank, total_docs);
 
         heap.push(Ranked(score, doc));
         if heap.len() > limit {
@@ -306,6 +309,7 @@ fn leapfrog(
             GlobalStats::average_length,
         )
         .max(1.0);
+    let params = segment.params();
     // Capped: a caller asking for every result must not make this try to
     // allocate for every result, and `limit + 1` on a huge limit overflows.
     let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
@@ -364,15 +368,15 @@ fn leapfrog(
 
         if !dropped {
             if let Some((length, rank)) = segment.doc_lengths(pivot) {
-                let length_norm = length_norm(length, average_length);
+                let length_norm = params.length_norm(length, average_length);
                 // Summed in the cursors' order, which is by document frequency
                 // and then by term - deterministic, so scores are reproducible.
                 let mut score = 0.0f32;
                 for (term_idf, cursor) in &cursors {
                     let tf = cursor.weighted_frequency();
-                    score += term_idf * saturation(tf, length_norm);
+                    score += term_idf * params.saturation(tf, length_norm);
                 }
-                score *= authority(rank, total_docs);
+                score *= params.authority(rank, total_docs);
                 heap.push(Ranked(score, pivot));
                 if heap.len() > limit {
                     heap.pop();
@@ -513,6 +517,7 @@ fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scoring::authority;
 
     #[test]
     fn intersection_keeps_only_common_ascending() {

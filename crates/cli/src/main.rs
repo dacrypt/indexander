@@ -27,6 +27,7 @@ use indexander_index::builder::SegmentBuilder;
 use indexander_index::manifest::Policy as MergePolicy;
 use indexander_index::merger::Merger;
 use indexander_index::query;
+use indexander_index::scoring::Params;
 use indexander_index::search::search;
 use indexander_index::segment::Segment;
 use indexander_rank::graph::GraphBuilder;
@@ -39,7 +40,8 @@ indexander — a search engine
 USAGE:
     indexander crawl <url>... [--out <segment>] [--pages <n>] [--depth <n>]
                               [--delay <ms>] [--concurrency <n>] [--any-host]
-    indexander index <directory> [--out <segment>]
+                              [--k1 <n>] [--b <n>]
+    indexander index <directory> [--out <segment>] [--k1 <n>] [--b <n>]
     indexander shard  --listen <addr> [--index <segment>]
     indexander leases --listen <addr> [--floor <ms>]     rate limits + robots.txt
     indexander merge  <directory> [--per-tier <n>] [--once] [--every <secs>]
@@ -56,6 +58,7 @@ The default segment path is ./indexander.ixdr
 EXAMPLES:
     indexander crawl https://example.com --pages 200 --depth 2
     indexander index ./docs
+    indexander index ./docs --b 1.0        # see docs/EVALUATION.md
     indexander search motor de busqueda
     indexander search '\"inverted index\"' -perl --limit 5
     indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
@@ -130,6 +133,8 @@ pub(crate) fn take_option(args: &[String], name: &str) -> (Option<String>, Vec<S
 /// arrive rather than after the crawl finishes, which is what keeps memory
 /// proportional to the index and not to the network.
 fn cmd_crawl(args: &[String]) -> Result<(), String> {
+    let (params, args) = take_params(args)?;
+    let args = &args[..];
     let (out, rest) = take_option(args, "--out");
     let (pages, rest) = take_option(&rest, "--pages");
     let (depth, rest) = take_option(&rest, "--depth");
@@ -181,7 +186,7 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let crawling = indexander_crawl::crawl_sharing(&config, &seeds, tx, politeness, robots);
         let indexing = async {
-            let mut builder = SegmentBuilder::new();
+            let mut builder = SegmentBuilder::with_params(params);
             let mut graph = GraphBuilder::new();
             while let Some(doc) = rx.recv().await {
                 if builder.document_count() % 25 == 0 && builder.document_count() > 0 {
@@ -583,7 +588,34 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads `--k1` and `--b`, leaving the defaults where a flag is absent.
+///
+/// They are set when a segment is written and never afterwards: the block-max
+/// bounds stored with every postings list are computed with them, so a segment
+/// carries them and a reader uses the segment's rather than its own.
+/// `docs/EVALUATION.md` has what they are worth and how to find out for a
+/// given corpus.
+fn take_params(args: &[String]) -> Result<(Params, Vec<String>), String> {
+    let (k1, rest) = take_option(args, "--k1");
+    let (b, rest) = take_option(&rest, "--b");
+    let mut params = Params::default();
+    if let Some(k1) = k1 {
+        params.k1 = k1.parse().map_err(|_| "--k1 needs a number".to_owned())?;
+    }
+    if let Some(b) = b {
+        params.b = b.parse().map_err(|_| "--b needs a number".to_owned())?;
+    }
+    if !params.is_usable() {
+        return Err(format!(
+            "scoring parameters must be finite and not negative, got {params:?}"
+        ));
+    }
+    Ok((params, rest))
+}
+
 fn cmd_index(args: &[String]) -> Result<(), String> {
+    let (params, args) = take_params(args)?;
+    let args = &args[..];
     let (out, rest) = take_option(args, "--out");
     let directory = rest
         .first()
@@ -593,7 +625,7 @@ fn cmd_index(args: &[String]) -> Result<(), String> {
     let started = std::time::Instant::now();
     let files = collect_files(Path::new(directory))?;
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let (builder, bytes_read) = build_index(&files, threads);
+    let (builder, bytes_read) = build_index(&files, threads, params);
 
     builder
         .write_to(&out)
@@ -632,22 +664,25 @@ fn cmd_index(args: &[String]) -> Result<(), String> {
 ///
 /// Slices are contiguous rather than interleaved so document ids stay in file
 /// order, which keeps a rebuild reproducible.
-fn build_index(files: &[PathBuf], threads: usize) -> (SegmentBuilder, u64) {
+fn build_index(files: &[PathBuf], threads: usize, params: Params) -> (SegmentBuilder, u64) {
     let threads = threads.max(1).min(files.len().max(1));
     let chunk = files.len().div_ceil(threads).max(1);
 
     let parts: Vec<(SegmentBuilder, u64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = files
             .chunks(chunk)
-            .map(|slice| scope.spawn(move || index_files(slice)))
+            .map(|slice| scope.spawn(move || index_files(slice, params)))
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| (SegmentBuilder::new(), 0)))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| (SegmentBuilder::with_params(params), 0))
+            })
             .collect()
     });
 
-    merge_tree(parts)
+    merge_tree(parts, params)
 }
 
 /// Merges partial indexes pairwise, in parallel, until one is left.
@@ -661,7 +696,7 @@ fn build_index(files: &[PathBuf], threads: usize) -> (SegmentBuilder, u64) {
 /// The order of absorption is preserved exactly — adjacent parts only, left
 /// into right — so document ids stay in corpus order and the result is still
 /// byte-identical to a single-threaded build.
-fn merge_tree(mut parts: Vec<(SegmentBuilder, u64)>) -> (SegmentBuilder, u64) {
+fn merge_tree(mut parts: Vec<(SegmentBuilder, u64)>, params: Params) -> (SegmentBuilder, u64) {
     while parts.len() > 1 {
         parts = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(parts.len().div_ceil(2));
@@ -681,16 +716,21 @@ fn merge_tree(mut parts: Vec<(SegmentBuilder, u64)>) -> (SegmentBuilder, u64) {
             }
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| (SegmentBuilder::new(), 0)))
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| (SegmentBuilder::with_params(params), 0))
+                })
                 .collect()
         });
     }
-    parts.pop().unwrap_or_else(|| (SegmentBuilder::new(), 0))
+    parts
+        .pop()
+        .unwrap_or_else(|| (SegmentBuilder::with_params(params), 0))
 }
 
 /// Indexes one slice of the corpus into its own builder.
-fn index_files(files: &[PathBuf]) -> (SegmentBuilder, u64) {
-    let mut builder = SegmentBuilder::new();
+fn index_files(files: &[PathBuf], params: Params) -> (SegmentBuilder, u64) {
+    let mut builder = SegmentBuilder::with_params(params);
     let mut bytes = 0u64;
     for path in files {
         let Ok(raw) = std::fs::read(path) else {
@@ -767,6 +807,12 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
         "avg doc length     {:.1} tokens",
         segment.average_document_length()
     );
+    // Written into the segment, not compiled into this binary: a reader has to
+    // be told which ones produced the bounds it is about to trust.
+    let params = segment.params();
+    println!("scoring k1         {:.3}", params.k1);
+    println!("scoring b          {:.3}", params.b);
+    println!("authority weight   {:.3}", params.authority_weight);
     Ok(())
 }
 

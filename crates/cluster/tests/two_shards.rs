@@ -209,3 +209,69 @@ async fn results_do_not_depend_on_which_shard_answers_first() {
         );
     }
 }
+
+/// Starts a shard whose segment was written with `params`.
+async fn start_with(docs: &[Document], params: indexander_index::scoring::Params) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    let mut builder = SegmentBuilder::with_params(params);
+    for doc in docs {
+        builder.add(doc);
+    }
+    let segment = Segment::from_bytes(builder.encode()).expect("segment");
+    let shard = Arc::new(ShardIndex::single(segment));
+    tokio::spawn(async move {
+        let _ = shard::serve(listener, shard).await;
+    });
+    address
+}
+
+/// Two shards scoring by different formulas produce numbers that cannot be
+/// compared, and the failure has no symptom: the query returns a ranking, just
+/// not a meaningful one. So it has to be refused rather than merged.
+#[tokio::test]
+async fn shards_that_disagree_about_scoring_refuse_the_query() {
+    use indexander_index::scoring::Params;
+
+    let a = start_with(&shard_a(), Params::default()).await;
+    let b = start_with(
+        &shard_b(),
+        Params {
+            b: 1.0,
+            ..Params::default()
+        },
+    )
+    .await;
+
+    let coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
+    let err = coordinator
+        .search("rust perl", 5)
+        .await
+        .expect_err("a ranking assembled from two formulas is not a ranking");
+    assert!(
+        err.to_string()
+            .contains("disagree about scoring parameters"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The same two shards, agreeing, still answer — so the refusal above is about
+/// disagreement and not about having two shards.
+#[tokio::test]
+async fn shards_that_agree_answer_as_before() {
+    use indexander_index::scoring::Params;
+
+    let harsh = Params {
+        b: 1.0,
+        ..Params::default()
+    };
+    let a = start_with(&shard_a(), harsh).await;
+    let b = start_with(&shard_b(), harsh).await;
+
+    let coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
+    let hits = coordinator
+        .search("rust perl", 5)
+        .await
+        .expect("shards agree");
+    assert_eq!(hits.len(), 2, "both matching documents, {hits:?}");
+}
