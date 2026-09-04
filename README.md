@@ -769,10 +769,28 @@ Stated plainly, because a README that only lists what works is a sales page:
   the bounds recorded for them — measured at 6% to 16% over, on a segment
   averaging 25 tokens against a corpus averaging 400. Pruning on a bound that
   does not bound drops results silently, so a query with corpus-wide statistics
-  walks everything. That costs a shard about 1.8x on the commonest term
-  (63 µs against 113 µs). The fix is to store what the bound is made of — the
-  block's largest weighted frequency, shortest document and highest rank —
-  and compute it at query time. A segment format change.
+  walks everything.
+
+  The obvious fix is to store what the bound is made of — the block's largest
+  weighted frequency, shortest document and highest rank — and rebuild it at
+  query time against whatever statistics are in play. That was built and
+  measured, and it does not work. Not because the bound is too loose in any
+  ordinary sense: it comes out 1.01x the exact one. It is that **block bounds
+  barely discriminate here at all.** Saturation cannot exceed `k1 + 1`, and on
+  this corpus every block of 128 postings holds some document whose term
+  frequency is high enough against its length to sit within a few percent of
+  that ceiling — the 51 blocks of `the` span 2.129 to 2.186 against a ceiling
+  of 2.2, a spread of 2.6%. Block-max works at all only because the threshold
+  is pressed up against the same ceiling, so the comparison is decided in that
+  last few percent. Loosening a bound by 1% turns the whole thing off:
+  measured over two segments, `the` went from 84 µs to 105 µs, and the index
+  grew 8% to hold the extra numbers.
+
+  Smaller blocks do not rescue it (`SKIP_INTERVAL` of 8 measures the same as
+  128) and neither does a different `b`. So this is not a matter of storing the
+  right thing; a shard would need bounds exactly as tight as the local ones
+  under statistics that are not knowable when the segment is written. Whatever
+  fixes it is a different pruning scheme, not a better bound.
 - **A judged collection in the repository.** The engine is measured against
   Cranfield, which is fetched and converted by
   [docs/cranfield.py](docs/cranfield.py) rather than committed. A larger,
