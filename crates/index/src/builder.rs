@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
-use indexander_core::{DocId, Document, Field, Position, Result};
+use indexander_core::{DocId, Document, Error, Field, Position, Result};
+
+use crate::segment::Segment;
 
 use crate::scoring::{authority, length_norm, saturation};
 
@@ -160,6 +162,55 @@ impl SegmentBuilder {
     #[must_use]
     pub fn uri(&self, id: DocId) -> Option<&str> {
         self.docs.get(id.as_usize()).map(|d| d.uri.as_str())
+    }
+
+    /// Rebuilds a builder from finished segments, as one index.
+    ///
+    /// This is what makes indexing incremental. Without it a crawl that adds a
+    /// thousand pages has to re-tokenise the whole corpus, because a segment
+    /// keeps postings, not text — the words are gone, only where they were is
+    /// left. So a merge works at the postings level: it reads what each
+    /// segment knows and writes it out as one.
+    ///
+    /// Documents keep their order, segment by segment, and their ids are
+    /// shifted the same way [`SegmentBuilder::absorb`] shifts them, so the
+    /// result is exactly the segment a single pass over all the documents in
+    /// that order would have produced.
+    pub fn from_segments(segments: &[&Segment]) -> Result<Self> {
+        let mut builder = Self::new();
+
+        for segment in segments {
+            let shift = u32::try_from(builder.docs.len())
+                .map_err(|_| Error::Corrupt("more than u32::MAX documents".into()))?;
+
+            for i in 0..segment.document_count() {
+                let id = DocId(u32::try_from(i).unwrap_or(u32::MAX));
+                let meta = segment
+                    .doc(id)
+                    .ok_or_else(|| Error::Corrupt("document store is short".into()))?;
+                builder.docs.push(StoredDoc {
+                    uri: meta.uri.clone(),
+                    lengths: meta.lengths,
+                    rank: meta.rank,
+                });
+            }
+
+            for term in segment.terms() {
+                let term = term?;
+                // Positions are needed: a merged segment that lost them would
+                // answer phrase queries with nothing and look merely unlucky.
+                let postings = segment.postings(&term)?;
+                let entry = builder.terms.entry(term).or_default();
+                for posting in postings {
+                    let occurrences = entry.entry(DocId(posting.doc.0 + shift)).or_default();
+                    for field in posting.fields {
+                        occurrences.fields[field.field as usize].positions =
+                            field.positions().to_vec();
+                    }
+                }
+            }
+        }
+        Ok(builder)
     }
 
     /// Absorbs another builder, as if its documents had been added after

@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 255, including full crawls and eight-shard queries over real sockets |
+| Tests | 264, including full crawls and eight-shard queries over real sockets |
 | Memory | 32 MB resident to serve a 236 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -197,6 +197,37 @@ one shard ends up holding a hundred times what another does. The cost is that a
 site's pages scatter, which matters for crawl politeness — and that is solved
 with per-host fetch leases, described in `docs/DISTRIBUTION.md`, not by
 sharding differently.
+
+### An index is a list of segments
+
+A segment is written once and never modified, which is what makes it cheap to
+map, replicate and serve. The price is that adding documents means writing
+another segment, so an index is a *list* of them and a background merge folds
+them back into one.
+
+Searching across them is the same problem the cluster has across shards, and
+`Index::search` solves it the same way: sum the per-segment statistics, then
+score every segment with the total. `scoring_each_segment_alone_would_give_a_different_answer`
+is the canary — it builds a nine-document segment and a hundred-document one,
+and asserts that scoring each with its own counts gives a *different* ranking.
+If it ever stops failing that way, the test that says segments agree is
+proving nothing.
+
+Merging is byte-exact: `a_merge_produces_exactly_the_single_pass_segment` folds
+2, 3, 7 and 130 segments and gets the same bytes a single pass over the
+documents would have written.
+
+### Equal scores
+
+Two documents that score identically come back in a stable order — ties break
+on the uri, not on a document id, because an id is where a document happened to
+land while indexing and a uri is what it *is*. Ordering by id would make
+results depend on how the corpus was split.
+
+What is *not* guaranteed is which of several equally-scoring documents survives
+a top-k cut. That is decided while scoring, by a heap that cannot afford a
+string comparison per candidate, so different segmentations can return
+different members of a tie. Said here rather than left for someone to find.
 
 ### PageRank does not shard, and that is the interesting part
 
@@ -434,7 +465,8 @@ Accents and case are folded the same way as at index time, so `Búsqueda`,
 
 ```
 crates/core    vocabulary: DocId, Document, Field, Error — no dependencies
-crates/index   tokenizer, codec, segment format, query parser, BM25 search
+crates/index   tokenizer, codec, segment format, query parser, BM25 search,
+               and an index of several segments searched as one
 crates/crawl   robots.txt, HTML extraction, URL normalisation, frontier, fetch
 crates/rank    the link graph as CSR, and PageRank over it
 crates/proto   the coordinator/shard wire protocol and shard routing
@@ -451,9 +483,9 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **Segment merging.** One segment per index still. Real corpora need many,
-  written incrementally and merged in the background — and a small consistent
-  store holding which segments make up a shard.
+- **A merge schedule, and the store that goes with it.** Merging works; what
+  decides *when* to merge, and the small consistent store recording which
+  segments make up a shard, do not exist.
 - **A shared `robots.txt` cache.** The lease authority paces requests but does
   not fetch `robots.txt`, so each node still makes that one request per host.
 - **Segment merging.** One segment per index today. Real corpora need many,

@@ -171,6 +171,13 @@ piece, not the hardest:
 Keeping the mutable metadata tiny and the data immutable is what lets the
 storage layer be boring, and the storage layer should be boring.
 
+**BM25 needs two corpus-wide numbers, not one.** The document frequency of
+each term, and the average document length. The second was missing until an
+index of several segments made it visible: a shard scoring against its own
+average makes a document look long or short depending on the company it keeps,
+and its scores stop being comparable with another shard's — the same failure as
+using local `idf`, and just as quiet. `Response::TermStats` carries both.
+
 **A copy is not a replica until it has been checked.** Segments carry a digest
 in their footer, written when the segment is built and free to read back. A
 transfer that reports success is not evidence: the file is written under a
@@ -208,8 +215,10 @@ error names every address that was tried.
 5. **Replication done; merge scheduling not.** `crates/cluster/src/replication.rs`
    copies a segment between nodes and refuses a copy whose digest does not
    match, and `Coordinator::connect_replicated` falls over to another replica
-   of a shard. Segment merging, and the small consistent store holding which
-   segments make up a shard, are still to do.
+   of a shard. Segment merging is built too — `Index::merge` folds several
+   segments into exactly the segment a single pass would have written. What is
+   still missing is the *schedule*: what decides when to merge, and the small
+   consistent store recording which segments make up a shard.
 
 Step 1 is most of the value: it is what stops the single-process assumption
 from being baked into another year of code.

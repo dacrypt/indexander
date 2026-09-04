@@ -12,6 +12,19 @@ use indexander_index::segment::Segment;
 /// Enough documents to cross several 128-posting skip blocks, with terms of
 /// very different frequencies.
 fn segment(n: usize) -> Segment {
+    let padding = [
+        "posicional",
+        "invertido",
+        "frontera",
+        "ancla",
+        "relevancia",
+        "consulta",
+        "segmento",
+        "bloque",
+        "salto",
+        "cortesia",
+        "latencia",
+    ];
     let mut b = SegmentBuilder::new();
     for i in 0..n {
         let mut body = format!("comun palabra numero {i}");
@@ -21,7 +34,23 @@ fn segment(n: usize) -> Segment {
         if i % 101 == 0 {
             body.push_str(" raro");
         }
-        b.add(&Document::new(format!("doc://{i}"), "titulo comun", body));
+        // Lengths vary, so no two documents score exactly alike.
+        //
+        // With identical scores, "the best three" has no single answer: a
+        // bounded top-k heap keeps whichever three it met first, and that
+        // depends on the limit, on block skipping, and on how the index was
+        // split. Tests that compare result *lists* need documents that can be
+        // ordered; the behaviour under real ties is asserted separately, in
+        // `tied_documents_come_back_in_a_stable_order`.
+        for word in &padding[..i % padding.len()] {
+            body.push(' ');
+            body.push_str(word);
+        }
+        b.add(&Document::new(
+            format!("doc://{i:05}"),
+            "titulo comun",
+            body,
+        ));
     }
     Segment::from_bytes(b.encode()).expect("segment")
 }

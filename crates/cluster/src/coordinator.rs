@@ -165,12 +165,14 @@ impl Coordinator {
             terms: terms.to_vec(),
         };
         let mut total_docs = 0usize;
+        let mut total_tokens = 0u64;
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
 
         for (address, response) in self.broadcast(&request).await? {
             match response {
                 Response::TermStats {
                     doc_count,
+                    total_length,
                     doc_freq: per_term,
                 } => {
                     if per_term.len() != terms.len() {
@@ -181,6 +183,7 @@ impl Coordinator {
                         )));
                     }
                     total_docs += doc_count;
+                    total_tokens += total_length;
                     for (term, freq) in terms.iter().zip(per_term) {
                         *doc_freq.entry(term.clone()).or_insert(0) += freq;
                     }
@@ -197,6 +200,7 @@ impl Coordinator {
         }
         Ok(GlobalTermStats {
             total_docs,
+            total_length: total_tokens,
             doc_freq,
         })
     }
@@ -217,6 +221,7 @@ impl Coordinator {
             query: query_text.to_owned(),
             limit,
             global_doc_count: stats.total_docs,
+            global_total_length: stats.total_length,
             global_doc_freq: stats
                 .doc_freq
                 .iter()
@@ -311,5 +316,8 @@ impl Coordinator {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GlobalTermStats {
     pub total_docs: usize,
+    /// Tokens across every document of every shard, so that every shard can
+    /// score against the corpus's average length rather than its own.
+    pub total_length: u64,
     pub doc_freq: HashMap<String, usize>,
 }

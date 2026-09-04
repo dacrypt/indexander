@@ -35,6 +35,8 @@ pub enum Request {
         query: String,
         limit: usize,
         global_doc_count: usize,
+        /// Tokens across every document of every shard.
+        global_total_length: u64,
         /// `(term, document frequency)` summed across every shard.
         global_doc_freq: Vec<(String, usize)>,
     },
@@ -92,6 +94,14 @@ pub enum Request {
 pub enum Response {
     TermStats {
         doc_count: usize,
+        /// Tokens across every document this shard holds.
+        ///
+        /// BM25 discounts a document by its length relative to the *corpus*
+        /// average, so the average has to be assembled the same way the
+        /// document frequencies are. Without this a shard scores against its
+        /// own average and its numbers stop meaning the same thing as another
+        /// shard's — the same failure as local `idf`, and just as quiet.
+        total_length: u64,
         /// Parallel to the requested terms, in the same order.
         doc_freq: Vec<usize>,
     },
@@ -196,12 +206,14 @@ impl Request {
                 query,
                 limit,
                 global_doc_count,
+                global_total_length,
                 global_doc_freq,
             } => {
                 w.u8(REQ_SEARCH);
                 w.str(query);
                 w.usize(*limit);
                 w.usize(*global_doc_count);
+                w.varint(*global_total_length);
                 w.usize(global_doc_freq.len());
                 for (term, freq) in global_doc_freq {
                     w.str(term);
@@ -271,6 +283,7 @@ impl Request {
                 let query = r.string()?;
                 let limit = r.usize()?;
                 let global_doc_count = r.usize()?;
+                let global_total_length = r.varint()?;
                 let count = r.count()?;
                 let mut global_doc_freq = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -281,6 +294,7 @@ impl Request {
                     query,
                     limit,
                     global_doc_count,
+                    global_total_length,
                     global_doc_freq,
                 }
             }
@@ -335,10 +349,12 @@ impl Response {
         match self {
             Self::TermStats {
                 doc_count,
+                total_length,
                 doc_freq,
             } => {
                 w.u8(RES_TERM_STATS);
                 w.usize(*doc_count);
+                w.varint(*total_length);
                 w.usize(doc_freq.len());
                 for freq in doc_freq {
                     w.usize(*freq);
@@ -424,6 +440,7 @@ impl Response {
         let message = match r.u8()? {
             RES_TERM_STATS => {
                 let doc_count = r.usize()?;
+                let total_length = r.varint()?;
                 let count = r.count()?;
                 let mut doc_freq = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -431,6 +448,7 @@ impl Response {
                 }
                 Self::TermStats {
                     doc_count,
+                    total_length,
                     doc_freq,
                 }
             }
@@ -557,6 +575,7 @@ mod tests {
             query: r#""motor de busqueda" -perl"#.into(),
             limit: 10,
             global_doc_count: 1_000_000,
+            global_total_length: 880_000_000,
             global_doc_freq: vec![("motor".into(), 4321), ("perl".into(), 7)],
         });
     }
@@ -566,6 +585,7 @@ mod tests {
         for response in [
             Response::TermStats {
                 doc_count: 500,
+                total_length: 4_400_000,
                 doc_freq: vec![1, 2, 3],
             },
             Response::Hits {
@@ -630,6 +650,7 @@ mod tests {
             query: "motor de busqueda".into(),
             limit: 10,
             global_doc_count: 99,
+            global_total_length: 880,
             global_doc_freq: vec![("motor".into(), 5)],
         }
         .encode();

@@ -65,6 +65,14 @@ pub struct FieldPosting {
     positions: Vec<Position>,
 }
 
+impl FieldPosting {
+    /// Where the term occurs, or empty if positions were not read.
+    #[must_use]
+    pub fn positions(&self) -> &[Position] {
+        &self.positions
+    }
+}
+
 /// One document's appearance in a term's postings list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posting {
@@ -348,6 +356,16 @@ impl Segment {
         self.average_length
     }
 
+    /// Tokens across every document, which is what an average is made of.
+    ///
+    /// A corpus-wide average cannot be assembled from per-segment averages
+    /// without also knowing how many documents each was over, so this is the
+    /// number that travels.
+    #[must_use]
+    pub fn total_length(&self) -> u64 {
+        self.docs.iter().map(|d| u64::from(d.total_length())).sum()
+    }
+
     #[must_use]
     pub fn doc(&self, id: DocId) -> Option<&DocMeta> {
         self.docs.get(id.as_usize())
@@ -373,6 +391,18 @@ impl Segment {
         let postings_at = read_varint(&self.bytes, &mut cursor)? as usize;
         let doc_freq = read_varint(&self.bytes, &mut cursor)? as usize;
         Ok((term, postings_at, doc_freq))
+    }
+
+    /// Every term in the segment, in sorted order.
+    ///
+    /// Sorted because the dictionary is, which is what lets a merge walk two
+    /// segments together instead of loading either one into memory.
+    pub fn terms(&self) -> impl Iterator<Item = Result<String>> + '_ {
+        (0..self.num_terms).map(move |i| {
+            let (bytes, _, _) = self.entry(i)?;
+            String::from_utf8(bytes.to_vec())
+                .map_err(|_| Error::Corrupt("term is not utf-8".into()))
+        })
     }
 
     /// How many documents contain `term`. Zero if it is not in the segment.

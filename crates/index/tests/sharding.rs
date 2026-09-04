@@ -89,7 +89,7 @@ fn global_stats(shards: &[&Segment], terms: &[&str]) -> GlobalStats {
             .iter()
             .map(|t| ((*t).to_owned(), shard.document_frequency(t).unwrap_or(0)))
             .collect();
-        stats.add_shard(shard.document_count(), &per_term);
+        stats.add_shard(shard.document_count(), shard.total_length(), &per_term);
     }
     stats
 }
@@ -165,6 +165,7 @@ fn a_term_missing_from_the_global_map_still_scores() {
     let whole = segment_of(&corpus());
     let stats = GlobalStats {
         total_docs: 42,
+        total_length: 42 * 8,
         doc_freq: HashMap::new(),
     };
     let hits = search_with_stats(&whole, &query::parse("rust"), 5, Some(&stats)).unwrap();

@@ -32,16 +32,36 @@ use crate::segment::{Posting, Segment};
 pub struct GlobalStats {
     /// Documents across every shard.
     pub total_docs: usize,
+    /// Tokens across every document of every shard.
+    ///
+    /// BM25 discounts a document by its length *relative to the average*, and
+    /// the average that matters is the corpus's. Scoring a shard against its
+    /// own average makes a document look long or short depending on the
+    /// company it keeps, and two shards' scores stop being comparable — the
+    /// same failure as using local `idf`, and just as invisible.
+    pub total_length: u64,
     /// How many of those contain each term.
     pub doc_freq: HashMap<String, usize>,
 }
 
 impl GlobalStats {
     /// Sums one shard's contribution into the running totals.
-    pub fn add_shard(&mut self, doc_count: usize, per_term: &[(String, usize)]) {
+    pub fn add_shard(&mut self, doc_count: usize, total_length: u64, per_term: &[(String, usize)]) {
         self.total_docs += doc_count;
+        self.total_length += total_length;
         for (term, freq) in per_term {
             *self.doc_freq.entry(term.clone()).or_insert(0) += freq;
+        }
+    }
+
+    /// The corpus-wide average document length.
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
+    pub fn average_length(&self) -> f32 {
+        if self.total_docs == 0 {
+            0.0
+        } else {
+            self.total_length as f32 / self.total_docs as f32
         }
     }
 
@@ -161,7 +181,15 @@ pub fn search_with_stats(
     };
 
     // Score what is left, keeping only the best `limit` in a bounded heap.
-    let average_length = segment.average_document_length().max(1.0);
+    // The corpus-wide average, not this segment's. A shard scoring against
+    // its own average makes a document look long or short depending on the
+    // company it keeps, and its scores stop being comparable with another's.
+    let average_length = global
+        .map_or_else(
+            || segment.average_document_length(),
+            GlobalStats::average_length,
+        )
+        .max(1.0);
     let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
 
     // Candidates ascend and so does every postings list, so the scorer walks
@@ -219,21 +247,7 @@ pub fn search_with_stats(
         }
     }
 
-    let mut ranked: Vec<Ranked> = heap.into_vec();
-    ranked.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.cmp(&b.1))
-    });
-
-    Ok(ranked
-        .into_iter()
-        .map(|Ranked(score, doc)| Hit {
-            doc,
-            uri: segment.doc(doc).map(|d| d.uri.clone()).unwrap_or_default(),
-            score,
-        })
-        .collect())
+    Ok(finish(heap, segment, limit))
 }
 
 /// Answers a phrase-free query by advancing cursors in step.
@@ -280,7 +294,15 @@ fn leapfrog(
         excluded.push(segment.cursor(term, false)?);
     }
 
-    let average_length = segment.average_document_length().max(1.0);
+    // The corpus-wide average, not this segment's. A shard scoring against
+    // its own average makes a document look long or short depending on the
+    // company it keeps, and its scores stop being comparable with another's.
+    let average_length = global
+        .map_or_else(
+            || segment.average_document_length(),
+            GlobalStats::average_length,
+        )
+        .max(1.0);
     // Capped: a caller asking for every result must not make this try to
     // allocate for every result, and `limit + 1` on a huge limit overflows.
     let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
@@ -368,21 +390,41 @@ fn leapfrog(
 
 /// Drains a top-k heap into hits, best first.
 fn finish(heap: BinaryHeap<Ranked>, segment: &Segment, limit: usize) -> Vec<Hit> {
-    let mut ranked: Vec<Ranked> = heap.into_vec();
-    ranked.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.cmp(&b.1))
-    });
-    ranked.truncate(limit);
-    ranked
+    let mut hits: Vec<Hit> = heap
+        .into_vec()
         .into_iter()
         .map(|Ranked(score, doc)| Hit {
             doc,
             uri: segment.doc(doc).map(|d| d.uri.clone()).unwrap_or_default(),
             score,
         })
-        .collect()
+        .collect();
+
+    // Ties break on the uri, not the document id.
+    //
+    // A document id is where a document happened to land while indexing; a
+    // uri is what the document *is*. Ordering equally-scoring results by id
+    // would make the order depend on how the corpus was split into segments
+    // and shards, which is not something a user should be able to notice.
+    //
+    // What this does not fix is *which* tied documents survive the top-k cut:
+    // that is decided while scoring, by a heap that cannot afford a string
+    // comparison per candidate. With genuinely equal scores, different
+    // segmentations can return different members of the tie. Documented in
+    // the README rather than papered over.
+    sort_hits(&mut hits);
+    hits.truncate(limit);
+    hits
+}
+
+/// Orders results best first, breaking ties on the uri.
+pub(crate) fn sort_hits(hits: &mut [Hit]) {
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.uri.cmp(&b.uri))
+    });
 }
 
 /// Narrows the corpus to the documents that can possibly match.

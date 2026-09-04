@@ -38,6 +38,7 @@ pub fn handle(segment: &Segment, request: &Request) -> Response {
                 .collect();
             Response::TermStats {
                 doc_count: segment.document_count(),
+                total_length: segment.total_length(),
                 doc_freq,
             }
         }
@@ -45,10 +46,12 @@ pub fn handle(segment: &Segment, request: &Request) -> Response {
             query,
             limit,
             global_doc_count,
+            global_total_length,
             global_doc_freq,
         } => {
             let stats = GlobalStats {
                 total_docs: *global_doc_count,
+                total_length: *global_total_length,
                 doc_freq: global_doc_freq.iter().cloned().collect(),
             };
             let parsed = query::parse(query);
@@ -164,6 +167,7 @@ mod tests {
             response,
             Response::TermStats {
                 doc_count: 2,
+                total_length: s.total_length(),
                 doc_freq: vec![2, 1, 0],
             }
         );
@@ -178,6 +182,7 @@ mod tests {
                 query: "perl".into(),
                 limit: 10,
                 global_doc_count: 0,
+                global_total_length: 0,
                 global_doc_freq: Vec::new(),
             },
         );
@@ -197,6 +202,7 @@ mod tests {
                 query: "motor".into(),
                 limit: 10,
                 global_doc_count: 0,
+                global_total_length: 0,
                 global_doc_freq: Vec::new(),
             },
         );
@@ -207,6 +213,7 @@ mod tests {
                 query: "motor".into(),
                 limit: 10,
                 global_doc_count: 1_000_000,
+                global_total_length: 8_000_000,
                 global_doc_freq: vec![("motor".into(), 3)],
             },
         );
