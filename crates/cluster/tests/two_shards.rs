@@ -100,7 +100,11 @@ async fn two_shards_agree_with_one_index() {
     let hits = coordinator.search("rust perl", 5).await.expect("search");
     let uris: Vec<String> = hits.into_iter().map(|h| h.uri).collect();
     assert_eq!(uris, single_index_ranking(5));
-    assert_eq!(uris.len(), 2);
+    assert_eq!(
+        uris.len(),
+        5,
+        "the limit; under union most documents qualify"
+    );
 }
 
 #[tokio::test]
@@ -273,5 +277,5 @@ async fn shards_that_agree_answer_as_before() {
         .search("rust perl", 5)
         .await
         .expect("shards agree");
-    assert_eq!(hits.len(), 2, "both matching documents, {hits:?}");
+    assert_eq!(hits.len(), 5, "the limit, {hits:?}");
 }

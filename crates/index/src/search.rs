@@ -160,11 +160,11 @@ pub fn search_with_stats(
     // than any amount of cleverness further down.
     let need_positions = !query.phrases.is_empty();
 
-    // Without phrases, the whole query can be answered by leapfrogging
-    // cursors, which never decodes a posting it does not need. With phrases,
-    // positions are needed anyway, so the straightforward path is used.
+    // Without phrases the answer is the union of the terms' postings, walked
+    // with cursors. With phrases, positions are needed anyway, so the
+    // straightforward path is used.
     if !need_positions {
-        return leapfrog(segment, query, limit, global, total_docs);
+        return union(segment, query, limit, global, total_docs);
     }
     let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
     for term in query.scoring_terms() {
@@ -256,17 +256,24 @@ pub fn search_with_stats(
     Ok(finish(heap, segment, limit))
 }
 
-/// Answers a phrase-free query by advancing cursors in step.
+/// Answers a phrase-free query by walking the union of its terms' postings.
 ///
-/// Every term is a cursor. The rarest one leads: it proposes a document, the
-/// others skip forward to it, and either they all agree — a match, scored on
-/// the spot — or the highest one becomes the new proposal. No cursor ever
-/// decodes a posting behind the pivot, so intersecting `kubernetes` with `the`
-/// costs roughly what `kubernetes` costs, instead of what `the` costs.
+/// Bare terms are optional, so a document qualifies by containing *any* of
+/// them and is ranked by how much of the query it accounts for — which BM25
+/// does on its own, by summing one contribution per term present. Nothing has
+/// to enforce "more terms is better"; arithmetic already does.
 ///
-/// This is the difference between a query that scales with the rarest term in
-/// it and one that scales with the commonest.
-fn leapfrog(
+/// This replaced an intersection, and the reason is worth keeping: requiring
+/// every term is a fine rule for the two or three words someone types into a
+/// box, and it collapses on a query that is a sentence. On the Cranfield
+/// collection, 225 questions averaging seventeen words, exactly four had any
+/// document at all containing every term. Intersection answered three of them.
+///
+/// The cursors are the same ones the intersection used, so a term still skips
+/// blocks instead of decoding them. What is gone is the pivot: a union cannot
+/// jump past a document just because one term is missing from it, because that
+/// document may still be a good answer.
+fn union(
     segment: &Segment,
     query: &Query,
     limit: usize,
@@ -278,20 +285,26 @@ fn leapfrog(
         return Ok(Vec::new());
     }
 
-    // Rarest first: the shortest list drives, and a term absent from the
-    // segment means nothing can match.
+    // In `scoring_terms` order, which is sorted, so contributions are summed
+    // the same way in every process. Floating-point addition is not
+    // associative and two shards must agree to the last bit.
     let mut cursors = Vec::with_capacity(terms.len());
     for term in &terms {
         let cursor = segment.cursor(term, false)?;
+        // A term this segment has never seen contributes nothing. Under
+        // intersection it meant the query could not match at all; under union
+        // it is simply one fewer thing to add up.
         if cursor.doc().is_none() {
-            return Ok(Vec::new());
+            continue;
         }
         let doc_freq = global
             .and_then(|g| g.doc_freq.get(term).copied())
             .unwrap_or_else(|| cursor.document_frequency());
         cursors.push((idf(total_docs, doc_freq), cursor));
     }
-    cursors.sort_by_key(|(_, c)| c.document_frequency());
+    if cursors.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // Excluded terms get cursors too, so exclusion is a skip rather than a
     // scan of the excluded term's entire list.
@@ -300,9 +313,6 @@ fn leapfrog(
         excluded.push(segment.cursor(term, false)?);
     }
 
-    // The corpus-wide average, not this segment's. A shard scoring against
-    // its own average makes a document look long or short depending on the
-    // company it keeps, and its scores stop being comparable with another's.
     let average_length = global
         .map_or_else(
             || segment.average_document_length(),
@@ -310,86 +320,43 @@ fn leapfrog(
         )
         .max(1.0);
     let params = segment.params();
-    // Capped: a caller asking for every result must not make this try to
-    // allocate for every result, and `limit + 1` on a huge limit overflows.
     let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
-    // The k-th best score so far. Zero until `limit` documents are in, so no
-    // block is skipped before there is something to compare against.
-    let mut threshold = 0.0f32;
 
-    while let Some(mut pivot) = cursors[0].1.doc() {
-        // Block-max: the most every cursor's current block could contribute.
-        // If that cannot reach the threshold, no document in the driver's
-        // block can either, so the block goes unread.
-        //
-        // This is worth a great deal for a query with one term, which has no
-        // second list to leapfrog against, and nothing at all for a query with
-        // several, where the leapfrog has already discarded everything that
-        // could be discarded. docs/BLOCK-MAX.md has the measurements.
-        if heap.len() >= limit && limit > 0 {
-            let ceiling: f32 = cursors
-                .iter()
-                .map(|(term_idf, cursor)| term_idf * cursor.block_bound())
-                .sum();
-            if ceiling < threshold {
-                cursors[0].1.skip_block()?;
-                continue;
-            }
-        }
-
-        // Bring everyone to the pivot, raising it whenever someone overshoots.
-        let mut aligned = true;
-        for (_, cursor) in &mut cursors[1..] {
-            cursor.seek(pivot)?;
-            match cursor.doc() {
-                None => return Ok(finish(heap, segment, limit)),
-                Some(doc) if doc != pivot => {
-                    pivot = doc;
-                    aligned = false;
-                    break;
-                }
-                Some(_) => {}
-            }
-        }
-        if !aligned {
-            cursors[0].1.seek(pivot)?;
-            continue;
-        }
-
-        // Every term is on `pivot`. Is it excluded?
+    // The lowest document any cursor is sitting on. Every cursor ascends, so
+    // this walks the union in document order without a merge buffer.
+    while let Some(doc) = cursors.iter().filter_map(|(_, c)| c.doc()).min() {
         let mut dropped = false;
         for cursor in &mut excluded {
-            cursor.seek(pivot)?;
-            if cursor.doc() == Some(pivot) {
+            cursor.seek(doc)?;
+            if cursor.doc() == Some(doc) {
                 dropped = true;
                 break;
             }
         }
 
         if !dropped {
-            if let Some((length, rank)) = segment.doc_lengths(pivot) {
+            if let Some((length, rank)) = segment.doc_lengths(doc) {
                 let length_norm = params.length_norm(length, average_length);
-                // Summed in the cursors' order, which is by document frequency
-                // and then by term - deterministic, so scores are reproducible.
                 let mut score = 0.0f32;
                 for (term_idf, cursor) in &cursors {
-                    let tf = cursor.weighted_frequency();
-                    score += term_idf * params.saturation(tf, length_norm);
+                    if cursor.doc() == Some(doc) {
+                        score +=
+                            term_idf * params.saturation(cursor.weighted_frequency(), length_norm);
+                    }
                 }
                 score *= params.authority(rank, total_docs);
-                heap.push(Ranked(score, pivot));
+                heap.push(Ranked(score, doc));
                 if heap.len() > limit {
                     heap.pop();
-                }
-                if heap.len() >= limit {
-                    // The heap keeps the lowest score on top, which is exactly
-                    // the k-th best and so exactly the threshold.
-                    threshold = heap.peek().map_or(0.0, |Ranked(s, _)| *s);
                 }
             }
         }
 
-        cursors[0].1.advance()?;
+        for (_, cursor) in &mut cursors {
+            if cursor.doc() == Some(doc) {
+                cursor.advance()?;
+            }
+        }
     }
 
     Ok(finish(heap, segment, limit))
@@ -436,27 +403,21 @@ pub(crate) fn sort_hits(hits: &mut [Hit]) {
 
 /// Narrows the corpus to the documents that can possibly match.
 ///
-/// Cheap filters first, expensive last: required terms intersect sorted
-/// posting lists, exclusions run only once the set is small, and phrases —
-/// which need positions and a scan per candidate — run last of all, on what
-/// survived. `None` means nothing can match.
+/// Only the hard parts of a query narrow anything. A phrase is a demand: its
+/// words have to be there, adjacent and in order. An exclusion is a demand.
+/// Bare terms are neither — they are what the ranking is *made of*, and a
+/// document missing one of them is a worse answer, not a non-answer.
+///
+/// Cheap filters first, expensive last: phrase terms intersect sorted posting
+/// lists, exclusions run once the set is small, and the positional phrase
+/// check — a scan per candidate — runs last of all. `None` means nothing can
+/// match.
 fn select_candidates(
     segment: &Segment,
     query: &Query,
     postings: &HashMap<String, Vec<Posting>>,
 ) -> Result<Option<Vec<DocId>>> {
-    // A required term with no postings means nothing can match.
     let mut candidates: Option<Vec<DocId>> = None;
-    for term in &query.required {
-        let docs: Vec<DocId> = postings[term].iter().map(|p| p.doc).collect();
-        candidates = Some(match candidates {
-            None => docs,
-            Some(previous) => intersect(&previous, &docs),
-        });
-        if candidates.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(None);
-        }
-    }
     for phrase in &query.phrases {
         for term in phrase {
             let docs: Vec<DocId> = postings[term].iter().map(|p| p.doc).collect();

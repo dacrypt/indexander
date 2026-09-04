@@ -4,17 +4,30 @@
 //! expect from a search box:
 //!
 //! ```text
-//! motor de busqueda      every term must appear
+//! motor de busqueda      any of these; more of them ranks higher
 //! "motor de busqueda"    the words must appear adjacent, in order
 //! -perl                  documents containing this term are dropped
 //! ```
+//!
+//! Bare terms are *optional*, not required. A document containing more of them
+//! scores higher on its own, because each contributes to the sum — nothing
+//! needs to enforce it. Requiring all of them instead sounds stricter and
+//! reads as better, and it is, right up to the query that is a sentence: on
+//! the Cranfield collection, whose queries are questions of seventeen words,
+//! exactly four of two hundred and twenty-five had *any* document containing
+//! every term. Conjunctive retrieval answered three of them and returned
+//! nothing for the rest.
+//!
+//! Quotes and `-` stay hard. Those are things a person asked for explicitly,
+//! and there is no reading of `-perl` that means "prefer documents without
+//! perl".
 
 use crate::tokenizer::fold;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Query {
-    /// Terms every result must contain.
-    pub required: Vec<String>,
+    /// Terms that contribute to a result's score. Any of them will do.
+    pub terms: Vec<String>,
     /// Terms no result may contain.
     pub excluded: Vec<String>,
     /// Sequences that must appear adjacent and in order, within one field.
@@ -24,13 +37,13 @@ pub struct Query {
 impl Query {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.required.is_empty() && self.phrases.is_empty()
+        self.terms.is_empty() && self.phrases.is_empty()
     }
 
     /// Every term the query cares about positively, for scoring.
     #[must_use]
     pub fn scoring_terms(&self) -> Vec<String> {
-        let mut terms = self.required.clone();
+        let mut terms = self.terms.clone();
         for phrase in &self.phrases {
             terms.extend(phrase.iter().cloned());
         }
@@ -67,7 +80,7 @@ pub fn parse(input: &str) -> Query {
                     if negated {
                         query.excluded.push(term.to_owned());
                     } else {
-                        query.required.push(term.to_owned());
+                        query.terms.push(term.to_owned());
                     }
                 }
                 negated = false;
@@ -94,9 +107,7 @@ pub fn parse(input: &str) -> Query {
                 match terms.len() {
                     0 => {}
                     // A one-word "phrase" is just a term.
-                    1 => query
-                        .required
-                        .push(terms.into_iter().next().expect("len 1")),
+                    1 => query.terms.push(terms.into_iter().next().expect("len 1")),
                     _ => query.phrases.push(terms),
                 }
             }
@@ -108,7 +119,7 @@ pub fn parse(input: &str) -> Query {
     flush_word!();
     let _ = negated;
 
-    query.required.dedup();
+    query.terms.dedup();
     query
 }
 
@@ -119,7 +130,7 @@ mod tests {
     #[test]
     fn bare_terms_are_all_required() {
         let q = parse("motor de busqueda");
-        assert_eq!(q.required, ["motor", "de", "busqueda"]);
+        assert_eq!(q.terms, ["motor", "de", "busqueda"]);
         assert!(q.excluded.is_empty());
         assert!(q.phrases.is_empty());
     }
@@ -127,34 +138,34 @@ mod tests {
     #[test]
     fn accents_and_case_are_folded_like_the_index() {
         let q = parse("BÚSQUEDA en Español");
-        assert_eq!(q.required, ["busqueda", "en", "espanol"]);
+        assert_eq!(q.terms, ["busqueda", "en", "espanol"]);
     }
 
     #[test]
     fn quotes_make_a_phrase() {
         let q = parse(r#"perl "motor de busqueda" 2004"#);
         assert_eq!(q.phrases, [["motor", "de", "busqueda"]]);
-        assert_eq!(q.required, ["perl", "2004"]);
+        assert_eq!(q.terms, ["perl", "2004"]);
     }
 
     #[test]
     fn a_one_word_phrase_is_just_a_term() {
         let q = parse(r#""perl""#);
         assert!(q.phrases.is_empty());
-        assert_eq!(q.required, ["perl"]);
+        assert_eq!(q.terms, ["perl"]);
     }
 
     #[test]
     fn minus_excludes() {
         let q = parse("buscador -google");
-        assert_eq!(q.required, ["buscador"]);
+        assert_eq!(q.terms, ["buscador"]);
         assert_eq!(q.excluded, ["google"]);
     }
 
     #[test]
     fn a_hyphen_inside_a_word_does_not_negate() {
         let q = parse("anchor-text");
-        assert_eq!(q.required, ["anchor", "text"]);
+        assert_eq!(q.terms, ["anchor", "text"]);
         assert!(q.excluded.is_empty());
     }
 

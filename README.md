@@ -36,10 +36,10 @@ language and the ranking are real and tested end to end.
 |---|---|
 | Indexing | 702 MiB of text into a 222 MiB index in 9.5–15.2 s on 14 threads, from 52.9–61.4 s on one |
 | Index size | 35% of the text it indexes |
-| Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
+| Query latency | 16 µs to 144 µs over 7,661 documents, warm; the older 103k-document figures elsewhere in this file were measured under the intersection semantics that bare terms no longer have |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Result quality | 0.557 MRR on known-item queries, and an ablation showing the number moves when the ranker is broken |
-| Tests | 373, including full crawls and eight-shard queries over real sockets |
+| Result quality | 0.258 MAP and 0.844 success@10 on Cranfield's human judgements; 0.557 MRR on known-item queries |
+| Tests | 374, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -663,10 +663,24 @@ rather than nearly.
 ## Query syntax
 
 ```text
-motor de busqueda      every term must appear
+motor de busqueda      any of these; a document with more of them ranks higher
 "motor de busqueda"    adjacent, in order, within one field
 -perl                  drop documents containing this term
 ```
+
+Bare terms are **optional**. Nothing enforces "more terms is better" — BM25
+sums one contribution per term present, so the document accounting for more of
+the query wins by arithmetic.
+
+Quotes and `-` stay hard. Those are things a person asked for explicitly, and
+there is no reading of `-perl` that means "prefer documents without perl".
+
+Requiring every term instead is a fine rule for the two or three words someone
+types into a box, and it collapses on a query that is a sentence. On the
+Cranfield collection — 225 questions averaging seventeen words — exactly four
+had *any* document containing every term. The engine answered three of them and
+returned nothing for the other 222, which was not a bug but the ceiling of the
+design. [docs/EVALUATION.md](docs/EVALUATION.md) has the whole account.
 
 Accents and case are folded the same way as at index time, so `Búsqueda`,
 `BUSQUEDA` and `busqueda` are one query.
@@ -701,9 +715,17 @@ Stated plainly, because a README that only lists what works is a sales page:
   just merged.
 - **Sweeping orphans.** They are listed, never deleted. Deciding a file is
   unreferenced is easy; deciding nobody is still reading it is not.
-- **A judged collection.** Ranking is measured against known-item queries,
-  which have one right answer and need no human. What documents are *about* is
-  a harder question and needs judgements this repository does not have.
+- **Recovering what the union cost.** Bare terms became optional, and a union
+  cannot skip a document just because one term is missing from it — so the
+  block-max bounds stored with every postings list, which used to let a common
+  term skip whole blocks, are no longer consulted while scoring. Measured, that
+  is 2.3x on the commonest term in the corpus (63 µs to 144 µs) and nothing
+  measurable on anything else. WAND would get it back, using the bounds that
+  are already there.
+- **A judged collection in the repository.** The engine is measured against
+  Cranfield, which is fetched and converted by
+  [docs/cranfield.py](docs/cranfield.py) rather than committed. A larger,
+  modern collection would say more.
 - **A document store.** Snippets are cut from the document's text, read back
   from its uri. That works for a corpus of files and not for a crawl, whose
   uris are URLs — and re-fetching a page to decorate a result line is not a

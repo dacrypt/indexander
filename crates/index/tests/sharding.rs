@@ -103,13 +103,17 @@ fn local_statistics_produce_a_different_ranking_than_one_index() {
     let q = query::parse("rust perl");
 
     let single = merge(search(&whole, &q, 5).unwrap(), 5);
-    assert_eq!(single.len(), 2, "expected both matching documents");
+    assert_eq!(
+        single.len(),
+        5,
+        "the limit, since every document has a term"
+    );
 
     let mut naive = search(&a, &q, 5).unwrap();
     naive.extend(search(&b, &q, 5).unwrap());
     let naive = merge(naive, 5);
 
-    assert_eq!(naive.len(), 2, "each shard should contribute one match");
+    assert_eq!(naive.len(), 5, "both shards contribute");
     assert_ne!(
         single, naive,
         "the corpus no longer exercises incomparable idf across shards"

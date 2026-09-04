@@ -198,30 +198,28 @@ fn a_single_document_index_still_works() {
     assert_eq!(cursor.doc(), None);
 }
 
-// --- the leapfrog path against brute force -------------------------------
+// --- the union path against brute force ----------------------------------
 
 use indexander_index::query;
 use indexander_index::search::search;
 
-/// Intersects postings the slow, obvious way, for comparison.
+/// Unions postings the slow, obvious way, for comparison.
+///
+/// Bare terms are optional, so a document qualifies by containing any of them.
+/// Exclusions still remove documents outright — those are demands.
 fn brute_force(segment: &Segment, terms: &[&str], excluded: &[&str]) -> Vec<DocId> {
-    let mut sets: Vec<Vec<DocId>> = terms
+    let mut out: Vec<DocId> = terms
         .iter()
-        .map(|t| {
+        .flat_map(|t| {
             segment
                 .postings_counts(t)
                 .expect("postings")
                 .into_iter()
                 .map(|p| p.doc)
-                .collect()
         })
         .collect();
-    let Some(mut out) = sets.pop() else {
-        return Vec::new();
-    };
-    for set in sets {
-        out.retain(|d| set.binary_search(d).is_ok());
-    }
+    out.sort_unstable();
+    out.dedup();
     for term in excluded {
         let drop: Vec<DocId> = segment
             .postings_counts(term)
@@ -236,7 +234,7 @@ fn brute_force(segment: &Segment, terms: &[&str], excluded: &[&str]) -> Vec<DocI
 }
 
 #[test]
-fn leapfrog_finds_exactly_what_brute_force_finds() {
+fn the_union_finds_exactly_what_brute_force_finds() {
     let s = segment(3000);
     let cases: &[(&str, &[&str], &[&str])] = &[
         ("comun", &["comun"], &[]),
@@ -245,7 +243,10 @@ fn leapfrog_finds_exactly_what_brute_force_finds() {
         ("comun septimo raro", &["comun", "septimo", "raro"], &[]),
         ("septimo -raro", &["septimo"], &["raro"]),
         ("comun -septimo", &["comun"], &["septimo"]),
+        // A term no document has removes nothing: under union it is one
+        // fewer contribution, not a reason to answer nothing.
         ("comun ausente", &["comun", "ausente"], &[]),
+        ("ausente", &["ausente"], &[]),
     ];
 
     for (query_text, terms, excluded) in cases {

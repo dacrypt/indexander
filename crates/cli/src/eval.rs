@@ -305,7 +305,7 @@ fn report(summary: &Summary, k: usize, documents: usize) {
     println!("  MAP                      {:.4}", summary.map());
     println!("  MRR                      {:.4}", summary.mrr());
     println!(
-        "  success@{k:<16} {:.4}   ({} quer{} found nothing)",
+        "  success@{k:<16} {:.4}   ({} quer{} with nothing relevant in the top {k})",
         summary.success_rate(),
         summary.failures(),
         if summary.failures() == 1 { "y" } else { "ies" }

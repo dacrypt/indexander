@@ -154,7 +154,11 @@ fn scoring_each_segment_alone_would_give_a_different_answer() {
 
     let parsed = query::parse("rust perl");
     let correct = uris(&search(&whole, &parsed, 10).expect("search"));
-    assert_eq!(correct.len(), 2, "both matching documents should be found");
+    assert_eq!(
+        correct.len(),
+        10,
+        "the limit, since every document has a term"
+    );
     assert_eq!(
         uris(&index.search(&parsed, 10).expect("search")),
         correct,

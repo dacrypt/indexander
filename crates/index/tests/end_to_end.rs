@@ -110,16 +110,32 @@ fn the_2004_bug_would_fail_this_test() {
 }
 
 #[test]
-fn all_terms_are_required() {
+fn a_document_with_more_of_the_query_ranks_above_one_with_less() {
     let segment = build();
-    // Only doc 1 has both.
-    let hits = search(&segment, &query::parse("rust bm25"), 10).unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].uri, "doc://indexander");
+    // Three documents, holding three, two and one of these words. Nothing
+    // enforces the resulting order: each term present adds a contribution, so
+    // the document accounting for more of the query wins by arithmetic.
+    let hits = search(&segment, &query::parse("motor busqueda rust"), 10).unwrap();
+    let uris: Vec<&str> = hits.iter().map(|h| h.uri.as_str()).collect();
+    assert_eq!(
+        uris,
+        ["doc://indexander", "doc://parasearch", "doc://perl"],
+        "{hits:?}"
+    );
+}
 
-    // No document has this combination.
+#[test]
+fn a_word_no_document_has_does_not_empty_the_results() {
+    let segment = build();
+    // The old rule answered nothing here, which is the behaviour that made a
+    // seventeen-word question unanswerable.
     let hits = search(&segment, &query::parse("rust cobol"), 10).unwrap();
-    assert!(hits.is_empty());
+    assert!(
+        !hits.is_empty(),
+        "the documents about rust are still answers"
+    );
+    let only_cobol = search(&segment, &query::parse("cobol"), 10).unwrap();
+    assert!(only_cobol.is_empty(), "no document mentions it at all");
 }
 
 #[test]

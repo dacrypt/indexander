@@ -228,6 +228,106 @@ $ indexander known-item ... --index b075.ixdr    MRR 0.5397  0.5724  0.5624
 $ indexander known-item ... --index b100.ixdr    MRR 0.6278  0.6407  0.6744
 ```
 
+
+## Cranfield: what human judgements said
+
+Everything above is measured against known-item queries, which need nobody's
+opinion and, it turns out, cannot see the engine's largest problem.
+
+The Cranfield collection is 1,400 aerodynamics abstracts, 225 questions, and
+1,837 human relevance judgements made by Cleverdon's group in the 1960s. It is
+small and it is old, and it is a real answer key.
+
+### Loading it correctly takes some care
+
+Three things about it bite anyone who loads it naively, and all three are
+handled in `convert.py` rather than assumed away:
+
+- **The relevance scale is inverted.** Cleverdon's 1 is "a complete answer" and
+  4 is "minimum interest". Loading it as though higher meant better ranks the
+  best documents last. The codes are flipped on the way in.
+- **Query ids skip.** `cran.qry` numbers its questions 001, 002, 004, … up to
+  365, while `cranqrel` numbers them 1 to 225 consecutively. The correspondence
+  is by *order*. Matching on the declared id silently pairs most queries with
+  the wrong judgements.
+- **`cranqrel` has three columns, not TREC's four**, and its last line has no
+  newline, so `wc -l` reports 1,836 judgements where there are 1,837.
+
+Also worth knowing: documents 471 and 995 are empty in the source — every field
+blank. Document 995 is judged *relevant* to query 125, so that one query has a
+correct answer that no engine can ever retrieve.
+
+### The first run measured a wall, not a ranking
+
+```
+  MAP                      0.0042
+  success@10               0.0133   (222 queries with nothing relevant in the top 10)
+```
+
+Not a bug. The engine required every query term to appear, Cranfield's questions
+average seventeen words, and no document contains seventeen given words.
+Measured over the documents and judgements directly, outside the engine:
+
+| | |
+|---|---|
+| queries where **any** document contains every term | 4 of 225 |
+| queries where a **relevant** document contains every term | 3 of 225 |
+| term coverage of the best relevant document | median 59% |
+
+The ceiling was three queries. The engine answered three. It was doing exactly
+what it was built to do, and what it was built to do cannot answer a question
+written as a sentence.
+
+Known-item evaluation could never have found this. A known-item query is a span
+lifted out of one document, so its terms co-occur *by construction* — the one
+shape of query for which requiring everything is free. A judged collection
+found it on the first run.
+
+### After making bare terms optional
+
+```
+  P@10                     0.2173
+  nDCG@10                  0.3203
+  MAP                      0.2580
+  MRR                      0.4932
+  success@10               0.8444   (35 queries with nothing relevant in the top 10)
+```
+
+A MAP of 0.26 is in the range published BM25 baselines report for this
+collection. That is not a claim of parity — different tokenisation, different
+preprocessing, no stemming here — but a number wildly outside that range would
+have meant something was still wrong, and it is not.
+
+### And the question that started all of this
+
+Known-item said full length normalisation was worth 0.087 MRR. Against human
+judgements:
+
+| b | MAP | nDCG@10 | P@10 | MRR |
+|---|---|---|---|---|
+| 0.00 | 0.2252 | 0.2791 | 0.1911 | 0.4538 |
+| 0.30 | 0.2459 | 0.2991 | 0.2031 | 0.4847 |
+| 0.50 | 0.2520 | 0.3107 | 0.2142 | 0.4899 |
+| **0.75** | 0.2580 | 0.3203 | **0.2173** | **0.4932** |
+| 0.90 | **0.2587** | 0.3195 | 0.2156 | 0.4926 |
+| 1.00 | 0.2575 | **0.3204** | 0.2164 | 0.4911 |
+
+**It is worth nothing.** The textbook 0.75 is at or within noise of the best on
+every metric, and 1.00 is marginally worse on four of five.
+
+The check that makes this a result rather than a shrug: `b` *does* matter here.
+Turning length normalisation off costs 15% of MAP, so the collection is not
+simply insensitive to the parameter and the flat top is real. It is fair to
+note that Cranfield's abstracts vary far less in length than source files do —
+a coefficient of variation of 0.54 against 5.25 — so there is less for `b` to
+act on. Less, but not none.
+
+So the default stays 0.75, now on evidence instead of caution. And the more
+useful conclusion is about the measurement rather than the parameter:
+known-item measures whether an engine can find a document from its own words,
+and that is not the same quantity as relevance. The documentation above said so
+before there was any way to check. There is now.
+
 ## What these numbers are not
 
 **Comparable to anyone else's.** Different corpus, different queries, different
@@ -236,7 +336,9 @@ a position in a league table.
 
 **A statement about relevance.** Known-item measures whether the engine can
 find a document from its own words. A person searching wants documents that are
-*about* something, which is a harder question and needs judgements.
+*about* something, which is a harder question and needs judgements — and when
+those judgements arrived, they disagreed with known-item about the one
+parameter both were asked to rule on.
 
 **Free of the unjudged-is-irrelevant assumption**, in the `eval` path. A
 document nobody judged scores as garbage, so a system that surfaces good
