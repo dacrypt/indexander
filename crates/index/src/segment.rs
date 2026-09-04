@@ -35,43 +35,58 @@ use indexander_core::{DocId, Error, Field, Position, Result};
 use crate::codec::{read_deltas, read_varint};
 
 pub(crate) const MAGIC: &[u8; 4] = b"IXDR";
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 /// Six u64 offsets, a u32 version, a 4-byte magic.
 pub(crate) const FOOTER_LEN: usize = 6 * 8 + 4 + 4;
+
+/// One term's appearance in one field of one document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldPosting {
+    pub field: Field,
+    /// How many times the term occurs in this field.
+    pub count: u32,
+    /// Where it occurs — empty unless the postings were read with positions.
+    ///
+    /// Positions are the bulk of an index: a common term has one document
+    /// gap per posting and dozens of positions behind it. Only phrase queries
+    /// ever look at them, so decoding them for a query that will not is the
+    /// single most expensive thing this engine can do for no reason.
+    positions: Vec<Position>,
+}
 
 /// One document's appearance in a term's postings list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posting {
     pub doc: DocId,
-    /// Positions per field, in the order the fields were written.
-    pub fields: Vec<(Field, Vec<Position>)>,
+    /// One entry per field the term appears in, in written order.
+    pub fields: Vec<FieldPosting>,
 }
 
 impl Posting {
     /// Total occurrences across all fields, unweighted.
     #[must_use]
     pub fn term_frequency(&self) -> u32 {
-        self.fields
-            .iter()
-            .map(|(_, positions)| positions.len() as u32)
-            .sum()
+        self.fields.iter().map(|f| f.count).sum()
     }
 
     /// Occurrences weighted by field, which is what the scorer wants.
+    ///
+    /// Reads counts, never positions, so it works on postings read either way.
     #[must_use]
     pub fn weighted_frequency(&self) -> f32 {
         self.fields
             .iter()
-            .map(|(field, positions)| field.weight() * positions.len() as f32)
+            .map(|f| f.field.weight() * f.count as f32)
             .sum()
     }
 
+    /// Where the term occurs in `field`. Empty if positions were not read.
     #[must_use]
     pub fn positions_in(&self, field: Field) -> &[Position] {
         self.fields
             .iter()
-            .find(|(f, _)| *f == field)
-            .map_or(&[], |(_, positions)| positions.as_slice())
+            .find(|f| f.field == field)
+            .map_or(&[], |f| f.positions.as_slice())
     }
 }
 
@@ -276,8 +291,24 @@ impl Segment {
         Ok(None)
     }
 
-    /// Decodes the full postings list for `term`.
+    /// Decodes the postings list for `term`, positions and all.
+    ///
+    /// Only phrase queries need this; everything else should use
+    /// [`Segment::postings_counts`], which is several times cheaper.
     pub fn postings(&self, term: &str) -> Result<Vec<Posting>> {
+        self.decode_postings(term, true)
+    }
+
+    /// Decodes the postings list for `term` without its positions.
+    ///
+    /// The position blocks are still walked — their lengths are varints, so
+    /// they cannot be jumped over without reading them — but nothing is
+    /// stored and nothing is allocated, which is where the cost actually was.
+    pub fn postings_counts(&self, term: &str) -> Result<Vec<Posting>> {
+        self.decode_postings(term, false)
+    }
+
+    fn decode_postings(&self, term: &str, want_positions: bool) -> Result<Vec<Posting>> {
         let Some((offset, _)) = self.lookup(term)? else {
             return Ok(Vec::new());
         };
@@ -305,8 +336,27 @@ impl Segment {
                     other => return Err(Error::Corrupt(format!("unknown field tag {other}"))),
                 };
                 let count = read_varint(&self.bytes, &mut cursor)? as usize;
-                read_deltas(&self.bytes, &mut cursor, count, &mut positions)?;
-                fields.push((field, positions.clone()));
+                let block_len = read_varint(&self.bytes, &mut cursor)? as usize;
+                if want_positions {
+                    let before = cursor;
+                    read_deltas(&self.bytes, &mut cursor, count, &mut positions)?;
+                    if cursor - before != block_len {
+                        return Err(Error::Corrupt("position block length disagrees".into()));
+                    }
+                } else {
+                    // One addition, whatever the block holds.
+                    cursor = cursor
+                        .checked_add(block_len)
+                        .filter(|c| *c <= self.bytes.len())
+                        .ok_or_else(|| Error::Corrupt("position block runs past end".into()))?;
+                    positions.clear();
+                }
+                fields.push(FieldPosting {
+                    field,
+                    count: u32::try_from(count)
+                        .map_err(|_| Error::Corrupt("term frequency exceeds u32".into()))?,
+                    positions: std::mem::take(&mut positions),
+                });
             }
             out.push(Posting {
                 doc: DocId(doc),

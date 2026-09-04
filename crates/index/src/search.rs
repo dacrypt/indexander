@@ -171,55 +171,23 @@ pub fn search_with_stats(
 
     // Postings for every term we care about, decoded once and shared between
     // the filtering pass and the scoring pass.
+    // Positions cost several times what document ids and counts cost, and
+    // only a phrase query ever reads them. Deciding once, here, is worth more
+    // than any amount of cleverness further down.
+    let need_positions = !query.phrases.is_empty();
     let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
     for term in query.scoring_terms() {
-        postings.insert(term.clone(), segment.postings(&term)?);
+        let list = if need_positions {
+            segment.postings(&term)?
+        } else {
+            segment.postings_counts(&term)?
+        };
+        postings.insert(term.clone(), list);
     }
 
-    // A required term with no postings means nothing can match.
-    let mut candidates: Option<Vec<DocId>> = None;
-    for term in &query.required {
-        let docs: Vec<DocId> = postings[term].iter().map(|p| p.doc).collect();
-        candidates = Some(match candidates {
-            None => docs,
-            Some(previous) => intersect(&previous, &docs),
-        });
-        if candidates.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Vec::new());
-        }
-    }
-    for phrase in &query.phrases {
-        for term in phrase {
-            let docs: Vec<DocId> = postings[term].iter().map(|p| p.doc).collect();
-            candidates = Some(match candidates {
-                None => docs,
-                Some(previous) => intersect(&previous, &docs),
-            });
-        }
-    }
-    let Some(mut candidates) = candidates else {
+    let Some(candidates) = select_candidates(segment, query, &postings)? else {
         return Ok(Vec::new());
     };
-
-    // Excluded terms are looked up only now, once the candidate set is small.
-    for term in &query.excluded {
-        let excluded: Vec<DocId> = segment.postings(term)?.iter().map(|p| p.doc).collect();
-        candidates.retain(|d| excluded.binary_search(d).is_err());
-    }
-
-    // Phrases are checked positionally, which is the expensive part, so it
-    // happens last and only on documents that already survived.
-    if !query.phrases.is_empty() {
-        candidates.retain(|&doc| {
-            query.phrases.iter().all(|phrase| {
-                let per_term: Option<Vec<&Posting>> = phrase
-                    .iter()
-                    .map(|t| postings[t].iter().find(|p| p.doc == doc))
-                    .collect();
-                per_term.is_some_and(|p| phrase_matches(&p, doc))
-            })
-        });
-    }
 
     // Score what is left, keeping only the best `limit` in a bounded heap.
     let average_length = segment.average_document_length().max(1.0);
@@ -295,6 +263,65 @@ pub fn search_with_stats(
             score,
         })
         .collect())
+}
+
+/// Narrows the corpus to the documents that can possibly match.
+///
+/// Cheap filters first, expensive last: required terms intersect sorted
+/// posting lists, exclusions run only once the set is small, and phrases —
+/// which need positions and a scan per candidate — run last of all, on what
+/// survived. `None` means nothing can match.
+fn select_candidates(
+    segment: &Segment,
+    query: &Query,
+    postings: &HashMap<String, Vec<Posting>>,
+) -> Result<Option<Vec<DocId>>> {
+    // A required term with no postings means nothing can match.
+    let mut candidates: Option<Vec<DocId>> = None;
+    for term in &query.required {
+        let docs: Vec<DocId> = postings[term].iter().map(|p| p.doc).collect();
+        candidates = Some(match candidates {
+            None => docs,
+            Some(previous) => intersect(&previous, &docs),
+        });
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(None);
+        }
+    }
+    for phrase in &query.phrases {
+        for term in phrase {
+            let docs: Vec<DocId> = postings[term].iter().map(|p| p.doc).collect();
+            candidates = Some(match candidates {
+                None => docs,
+                Some(previous) => intersect(&previous, &docs),
+            });
+        }
+    }
+    let Some(mut candidates) = candidates else {
+        return Ok(None);
+    };
+
+    // Excluded terms are looked up only now, once the candidate set is small.
+    for term in &query.excluded {
+        let excluded: Vec<DocId> = segment.postings(term)?.iter().map(|p| p.doc).collect();
+        candidates.retain(|d| excluded.binary_search(d).is_err());
+    }
+
+    // Phrases are checked positionally, which is the expensive part, so it
+    // happens last and only on documents that already survived.
+    if !query.phrases.is_empty() {
+        candidates.retain(|&doc| {
+            query.phrases.iter().all(|phrase| {
+                let per_term: Option<Vec<&Posting>> = phrase
+                    .iter()
+                    .map(|t| postings[t].iter().find(|p| p.doc == doc))
+                    .collect();
+                per_term.is_some_and(|p| phrase_matches(&p, doc))
+            })
+        });
+    }
+
+    Ok(Some(candidates))
 }
 
 /// Intersects two ascending, deduplicated document lists.

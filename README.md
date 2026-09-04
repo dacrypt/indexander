@@ -33,8 +33,8 @@ language and the ranking are real and tested end to end.
 | | |
 |---|---|
 | Indexing | 702 MiB of text into a 222 MiB index in 9.5–15.2 s on 14 threads, from 52.9–61.4 s on one |
-| Index size | 27–36% of the text it indexes, across three real corpora |
-| Query latency | 1.2–1.4 ms over 103,257 documents; 376 µs for a phrase |
+| Index size | 32–36% of the text it indexes, across three real corpora |
+| Query latency | 24 µs to 1.5 ms over 103,257 documents, by term frequency; 350 µs for a phrase |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Tests | 187, including full crawls and eight-shard queries over real sockets |
 | `unsafe` | none |
@@ -220,6 +220,23 @@ body 1×. Anchor text is the idea that a page is often better described by how
 others link to it than by what it says about itself — the `anchor_queue` of the
 original design, still here.
 
+**Positions are decoded only when something needs them.** Positions are the
+bulk of an index — a common term has one document gap and dozens of positions
+behind it — and only a phrase query ever reads them. Skipping them for every
+other query, and storing each position block's byte length so skipping is one
+addition rather than a walk over every varint in it, is where the query time
+went:
+
+| query | before | after |
+|---|---|---|
+| a rare term | 525 µs | **24 µs** |
+| a term in most documents | 3.38 ms | **0.99 ms** |
+| four terms, one of them common | 4.77 ms | **1.45 ms** |
+
+The block lengths cost 6.2% more index — 222.6 MiB became 236.4 MiB — for
+between 3.4× and 17.5× on the queries that do not need what they skip. Phrase
+queries pay the same as before, because they read the positions anyway.
+
 **Storage is delta plus varint.** Postings are written in ascending document
 order as gaps, and gaps as LEB128 varints, so a document id that follows its
 predecessor costs one byte instead of four. That is most of why the index is a
@@ -292,8 +309,12 @@ Stated plainly, because a README that only lists what works is a sales page:
   to 5 of `docs/DISTRIBUTION.md`.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
-- **Memory mapping.** Segments are read into memory. `mmap` avoids the copy but
-  needs `unsafe`, and the copy is not yet what makes anything slow.
+- **Memory mapping.** Segments are read into memory: a 236 MiB index is 236 MiB
+  of RSS and a read before a shard can answer anything. `mmap` avoids both, and
+  is now the largest remaining win.
+- **Skipping within a postings list.** A query still walks every posting of
+  every term. Block-max indexes let a scorer prove a whole block cannot reach
+  the current top-k and jump it.
 - **Concurrency.** Indexing is single threaded on a 14-core machine. The
   per-document work is independent; this is the largest easy win available.
 - **Snippets.** Positions are stored, so highlighted extracts are a query away.

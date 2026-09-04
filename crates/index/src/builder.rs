@@ -197,7 +197,16 @@ impl SegmentBuilder {
                 for (field_index, field) in present {
                     out.push(field_index as u8);
                     write_varint(field.positions.len() as u64, &mut out);
-                    write_deltas(&field.positions, &mut out);
+
+                    // The byte length of the position block, so a reader that
+                    // does not want positions can jump the whole thing with an
+                    // addition instead of walking every varint in it. Costs
+                    // one or two bytes per field per document; saves reading
+                    // most of the index on any query without a phrase.
+                    let mut positions = Vec::new();
+                    write_deltas(&field.positions, &mut positions);
+                    write_varint(positions.len() as u64, &mut out);
+                    out.extend_from_slice(&positions);
                 }
             }
             term_meta.push((offset, docs.len() as u64));
