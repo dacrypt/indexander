@@ -128,6 +128,17 @@ measured in minutes, run on a schedule, not on the query path — which is
 exactly why ranks are **stored in the segment** rather than computed at query
 time.
 
+As implemented, boundary messages carry the target's **URL**, not a global id.
+That is heavier on the wire than it needs to be — a production version assigns
+dense global ids once and sends those — and it is impossible to get subtly
+wrong, which for a first version of an algorithm whose failures are invisible
+is the better trade. `crates/rank/src/distributed.rs` says so where it does it.
+
+One thing the implementation makes plainer than the description above: a shard
+must own every node it holds *before* the first iteration, including pages with
+no outgoing links. A dangling page holds rank; a page nobody owns holds none,
+and the vector quietly stops summing to one.
+
 ## 5. The storage layer
 
 Segments are immutable files. That makes the "distributed database" the easiest
@@ -157,7 +168,13 @@ storage layer be boring, and the storage layer should be boring.
    authority; `indexander crawl --leases <addr>` defers to it. The crawler
    asks a channel and cannot tell whether the answer came from this process or
    a socket, so a one-node crawl and a fifty-node crawl run the same code.
-4. Distributed PageRank with boundary exchange.
+4. **Partly done.** The algorithm and its three exchanges are in
+   `crates/rank/src/distributed.rs`, and `crates/rank/tests/distributed.rs`
+   asserts that splitting a graph across 2, 3, 5, 8 or 17 shards gives the same
+   ranks and the same *order* as computing it in one process. What is not done
+   is the transport: the exchanges are data structures, not messages on a
+   socket. That is the same shape as step 1 — the algorithm no longer assumes
+   one process, and wiring it is mechanical.
 5. Replication and merge scheduling.
 
 Step 1 is most of the value: it is what stops the single-process assumption

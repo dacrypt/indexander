@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 227, including full crawls and eight-shard queries over real sockets |
+| Tests | 236, including full crawls and eight-shard queries over real sockets |
 | Memory | 32 MB resident to serve a 236 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -197,6 +197,32 @@ one shard ends up holding a hundred times what another does. The cost is that a
 site's pages scatter, which matters for crawl politeness — and that is solved
 with per-host fetch leases, described in `docs/DISTRIBUTION.md`, not by
 sharding differently.
+
+### PageRank does not shard, and that is the interesting part
+
+Everything else here shards cleanly. A shard indexes its own documents, answers
+about its own postings, and needs only to be told the corpus-wide term
+statistics. PageRank is a global fixed point: a page's rank depends on the
+pages linking to it, wherever those live, and the answer is not the
+concatenation of local answers.
+
+So an iteration has three exchanges, and dropping any of them gives a result
+that looks plausible and is wrong:
+
+- **Rank across the boundary.** Without it, a link between two shards counts
+  for nothing, and importance stops at a partition nobody chose for editorial
+  reasons.
+- **Dangling mass, globally.** A page with no outlinks holds mass that must
+  return to circulation across every node in the cluster. Summing it per shard
+  concentrates rank wherever the dead ends happen to live.
+- **Convergence, globally.** A shard cannot decide the iteration is done: it
+  can be perfectly still while a neighbour is still moving, and stopping early
+  leaves it ranked against stale numbers.
+
+`many_shards_match_one_process` runs the same graph across 2, 3, 5, 8 and 17
+shards and checks every rank against the single-process answer;
+`the_ranking_order_survives_partitioning` checks the thing a user would
+actually notice.
 
 ### Politeness belongs to one node per host
 
@@ -403,10 +429,11 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **Distributed PageRank.** It is a global fixed point, so an iteration has to
-  exchange rank mass across shard boundaries and convergence has to be decided
-  globally. Step 4 of `docs/DISTRIBUTION.md`; today a crawl's graph is ranked
-  in one process.
+- **The transport for distributed PageRank.** The algorithm is built and
+  tested — splitting a graph across seventeen shards gives the same ranks and
+  the same order as one process — but its three exchanges are still data
+  structures rather than messages on a socket. Step 4 of
+  `docs/DISTRIBUTION.md`.
 - **Replication.** Segments are immutable files, which makes this the easy
   part, and it is not done. Step 5.
 - **A shared `robots.txt` cache.** The lease authority paces requests but does
