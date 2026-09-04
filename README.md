@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 282, including full crawls and eight-shard queries over real sockets |
+| Tests | 288, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -235,6 +235,26 @@ checks the other side of the same trade.
 Small tiers go first: merging the small segments is cheap and removes the most
 files per byte rewritten. A small segment is never folded into a huge one,
 which would rewrite the huge one to save a file.
+
+```console
+$ indexander merge ./index --per-tier 4
+  4 segments -> 44906b3a549fc495.ixdr (120 documents, 29.5 KiB)
+  ...
+6 merges folding 24 segments in 87.67ms
+```
+
+Twenty segments become two, six hundred documents stay six hundred, and the
+directory is left with no files the manifest does not name.
+
+**A merge is safe to interrupt**, which matters because on a real index it
+takes minutes. It writes its new segment first, under a name derived from that
+segment's own digest, and replaces the manifest last. The manifest is the only
+thing that decides what an index is, so before that rename the index is exactly
+what it was and after it exactly what it became — a merge that died leaves a
+file nobody references, not an index nobody can read.
+`a_merge_that_dies_before_the_manifest_changes_nothing` kills one at that
+point and checks both halves. Naming segments by their digest also makes a
+retry free: the same merge run twice writes the same bytes to the same name.
 
 The manifest — which segments make up an index, and their digests — is the only
 mutable state in the whole store, and it is kilobytes of text. Text on purpose:
@@ -520,9 +540,9 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **A background merger.** The policy decides what to merge and `Index` can
-  merge it; nothing yet runs the two on a schedule, or replicates a new
-  manifest to a shard's other copies.
+- **Running the merger on a schedule, and replicating a new manifest** to a
+  shard's other copies. `indexander merge` does the work; nothing yet decides
+  when to call it or tells the replicas afterwards.
 - **A shared `robots.txt` cache.** The lease authority paces requests but does
   not fetch `robots.txt`, so each node still makes that one request per host.
 - **Segment merging.** One segment per index today. Real corpora need many,

@@ -218,8 +218,11 @@ error names every address that was tried.
    of a shard. Segment merging is built — `Index::merge` folds several segments
    into exactly the segment a single pass would have written — and so is the
    manifest that records which segments make up an index and the tiered policy
-   that decides what to fold next. What is missing is the daemon that runs them
-   on a schedule and replicates a new manifest to a shard's other copies.
+   that decides what to fold next. `indexander merge` does the merges,
+   restartably: the new segment is written before the manifest is replaced, so
+   an interrupted merge leaves an unreferenced file rather than a broken index.
+   What is missing is what calls it on a schedule, and telling a shard's other
+   replicas that the manifest changed.
 
 Step 1 is most of the value: it is what stops the single-process assumption
 from being baked into another year of code.

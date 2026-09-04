@@ -2,6 +2,7 @@ pub mod builder;
 pub mod codec;
 pub mod index;
 pub mod manifest;
+pub mod merger;
 pub mod query;
 pub mod scoring;
 pub mod search;

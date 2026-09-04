@@ -20,6 +20,8 @@ use indexander_core::Document;
 use indexander_crawl::Config;
 use indexander_crawl::politeness::Politeness;
 use indexander_index::builder::SegmentBuilder;
+use indexander_index::manifest::Policy as MergePolicy;
+use indexander_index::merger::Merger;
 use indexander_index::query;
 use indexander_index::search::search;
 use indexander_index::segment::Segment;
@@ -36,6 +38,7 @@ USAGE:
     indexander index <directory> [--out <segment>]
     indexander shard  --listen <addr> [--index <segment>]
     indexander leases --listen <addr> [--floor <ms>]
+    indexander merge  <directory> [--per-tier <n>] [--once]
     indexander search <query>... [--index <segment>] [--limit <n>]
                                  [--shards <addr,addr,...>]
     indexander stats [--index <segment>]
@@ -49,6 +52,7 @@ EXAMPLES:
     indexander search '\"inverted index\"' -perl --limit 5
     indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
     indexander leases --listen 127.0.0.1:7900 --floor 1000
+    indexander merge ./index --per-tier 8
     indexander crawl https://example.com --leases 127.0.0.1:7900
     indexander search motor --shards 127.0.0.1:7801,127.0.0.1:7802
 ";
@@ -75,6 +79,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "crawl" => cmd_crawl(&args[1..]),
         "shard" => cmd_shard(&args[1..]),
         "leases" => cmd_leases(&args[1..]),
+        "merge" => cmd_merge(&args[1..]),
         "index" => cmd_index(&args[1..]),
         "search" => cmd_search(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
@@ -383,6 +388,76 @@ fn cmd_leases(args: &[String]) -> Result<(), String> {
             .await
             .map_err(|e| format!("serving: {e}"))
     })
+}
+
+/// Folds an index's segments together, as a background merger would.
+///
+/// Safe to interrupt. A merge writes its new segment before replacing the
+/// manifest, and the manifest is the only thing that decides what an index is,
+/// so a merge killed halfway leaves a file nobody references rather than an
+/// index nobody can read.
+fn cmd_merge(args: &[String]) -> Result<(), String> {
+    let (per_tier, rest) = take_option(args, "--per-tier");
+    let (once, rest): (Vec<String>, Vec<String>) = rest.into_iter().partition(|a| a == "--once");
+    let directory = rest
+        .first()
+        .ok_or_else(|| format!("merge needs a directory\n\n{USAGE}"))?;
+
+    let mut policy = MergePolicy::default();
+    if let Some(value) = per_tier {
+        policy.segments_per_tier = value
+            .parse()
+            .map_err(|_| "--per-tier needs a number".to_owned())?;
+    }
+
+    let merger = Merger::new(Path::new(directory), policy);
+    let started = std::time::Instant::now();
+    let reports = if once.is_empty() {
+        merger.run_to_completion().map_err(|e| e.to_string())?
+    } else {
+        merger
+            .step()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect()
+    };
+
+    if reports.is_empty() {
+        println!("nothing to merge");
+        return Ok(());
+    }
+    let mut folded = 0usize;
+    for report in &reports {
+        println!(
+            "  {} segments -> {} ({} documents, {})",
+            report.merged.len(),
+            report.produced,
+            report.documents,
+            human_bytes(report.bytes)
+        );
+        folded += report.merged.len();
+        for stuck in &report.undeleted {
+            println!("    {stuck} could not be removed; it is unreferenced now");
+        }
+    }
+    println!(
+        "{} merge{} folding {folded} segments in {:.2?}",
+        reports.len(),
+        if reports.len() == 1 { "" } else { "s" },
+        started.elapsed()
+    );
+
+    let orphans = merger.orphans().map_err(|e| e.to_string())?;
+    if !orphans.is_empty() {
+        println!(
+            "\n{} unreferenced file{} in the directory: {}",
+            orphans.len(),
+            if orphans.len() == 1 { "" } else { "s" },
+            orphans.join(", ")
+        );
+        println!("left in place: whether they are safe to delete depends on who is still reading");
+    }
+    Ok(())
 }
 
 fn cmd_index(args: &[String]) -> Result<(), String> {
