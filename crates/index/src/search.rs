@@ -16,35 +16,8 @@ use std::collections::{BinaryHeap, HashMap};
 use indexander_core::{DocId, Field, Result};
 
 use crate::query::Query;
+use crate::scoring::{authority, idf, length_norm, saturation};
 use crate::segment::{Posting, Segment};
-
-/// Saturation: how quickly extra occurrences of a term stop adding score.
-const K1: f32 = 1.2;
-/// Length normalisation: how much a long document is penalised. 0 disables it.
-const B: f32 = 0.75;
-/// How much authority is allowed to move a result.
-///
-/// Relevance decides *whether* a page can appear; authority decides the order
-/// among pages that already match. This is why the boost multiplies BM25
-/// rather than being added to it: a page about nothing cannot buy its way in
-/// with links, however many it has.
-const AUTHORITY_WEIGHT: f32 = 0.5;
-
-/// Turns a PageRank into a multiplier around 1.0.
-///
-/// `rank * n` is the page's rank relative to the average page, so an ordinary
-/// page sits at 1.0 and gets no boost. The logarithm is what keeps a page that
-/// is a thousand times more central from being a thousand times higher: in a
-/// real web graph ranks span many orders of magnitude, and without it
-/// authority would simply overwrite relevance.
-fn authority(rank: f32, total_docs: usize) -> f32 {
-    if rank <= 0.0 {
-        return 1.0;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let relative = rank * total_docs as f32;
-    1.0 + AUTHORITY_WEIGHT * relative.max(0.0).ln_1p()
-}
 
 /// Corpus-wide term statistics, supplied from outside.
 ///
@@ -108,15 +81,6 @@ impl PartialOrd for Ranked {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
-}
-
-/// Inverse document frequency, the part of BM25 that makes rare words matter.
-fn idf(total_docs: usize, doc_freq: usize) -> f32 {
-    let n = total_docs as f32;
-    let df = doc_freq as f32;
-    // The +1 inside the logarithm keeps this positive even for a term that
-    // appears in every document, which the textbook formula does not.
-    ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
 }
 
 /// True when `phrase` occurs adjacent and in order within a single field.
@@ -198,7 +162,7 @@ pub fn search_with_stats(
 
     // Score what is left, keeping only the best `limit` in a bounded heap.
     let average_length = segment.average_document_length().max(1.0);
-    let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
+    let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
 
     // Candidates ascend and so does every postings list, so the scorer walks
     // them together with one cursor per term. Looking each candidate up with a
@@ -231,7 +195,7 @@ pub fn search_with_stats(
         let Some(meta) = segment.doc(doc) else {
             continue;
         };
-        let length_norm = 1.0 - B + B * (meta.total_length() as f32 / average_length);
+        let length_norm = length_norm(meta.total_length(), average_length);
         let mut score = 0.0f32;
 
         for (term_idf, list, cursor) in &mut scorers {
@@ -242,7 +206,7 @@ pub fn search_with_stats(
                 continue;
             };
             let tf = posting.weighted_frequency();
-            score += *term_idf * (tf * (K1 + 1.0)) / (tf + K1 * length_norm);
+            score += *term_idf * saturation(tf, length_norm);
         }
 
         // Authority scales relevance; it never creates it. A document that
@@ -317,9 +281,33 @@ fn leapfrog(
     }
 
     let average_length = segment.average_document_length().max(1.0);
-    let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
+    // Capped: a caller asking for every result must not make this try to
+    // allocate for every result, and `limit + 1` on a huge limit overflows.
+    let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
+    // The k-th best score so far. Zero until `limit` documents are in, so no
+    // block is skipped before there is something to compare against.
+    let mut threshold = 0.0f32;
 
     while let Some(mut pivot) = cursors[0].1.doc() {
+        // Block-max: the most every cursor's current block could contribute.
+        // If that cannot reach the threshold, no document in the driver's
+        // block can either, so the block goes unread.
+        //
+        // This is worth a great deal for a query with one term, which has no
+        // second list to leapfrog against, and nothing at all for a query with
+        // several, where the leapfrog has already discarded everything that
+        // could be discarded. docs/BLOCK-MAX.md has the measurements.
+        if heap.len() >= limit && limit > 0 {
+            let ceiling: f32 = cursors
+                .iter()
+                .map(|(term_idf, cursor)| term_idf * cursor.block_bound())
+                .sum();
+            if ceiling < threshold {
+                cursors[0].1.skip_block()?;
+                continue;
+            }
+        }
+
         // Bring everyone to the pivot, raising it whenever someone overshoots.
         let mut aligned = true;
         for (_, cursor) in &mut cursors[1..] {
@@ -351,18 +339,23 @@ fn leapfrog(
 
         if !dropped {
             if let Some(meta) = segment.doc(pivot) {
-                let length_norm = 1.0 - B + B * (meta.total_length() as f32 / average_length);
+                let length_norm = length_norm(meta.total_length(), average_length);
                 // Summed in the cursors' order, which is by document frequency
                 // and then by term - deterministic, so scores are reproducible.
                 let mut score = 0.0f32;
                 for (term_idf, cursor) in &cursors {
                     let tf = cursor.weighted_frequency();
-                    score += term_idf * (tf * (K1 + 1.0)) / (tf + K1 * length_norm);
+                    score += term_idf * saturation(tf, length_norm);
                 }
                 score *= authority(meta.rank, total_docs);
                 heap.push(Ranked(score, pivot));
                 if heap.len() > limit {
                     heap.pop();
+                }
+                if heap.len() >= limit {
+                    // The heap keeps the lowest score on top, which is exactly
+                    // the k-th best and so exactly the threshold.
+                    threshold = heap.peek().map_or(0.0, |Ranked(s, _)| *s);
                 }
             }
         }

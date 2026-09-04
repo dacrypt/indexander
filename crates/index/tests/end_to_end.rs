@@ -236,15 +236,48 @@ fn document_frequency_matches_the_postings_list() {
 #[test]
 fn the_index_is_smaller_than_the_text_it_indexes() {
     // The point of delta plus varint encoding, stated as a test.
+    //
+    // The corpus has to have real vocabulary variety, because the ratio is a
+    // property of the text as much as of the encoding: five hundred copies of
+    // one sentence produce five hundred postings and five hundred position
+    // lists for each of a dozen terms, and an index that is *larger* than the
+    // text. Real prose is nothing like that. A degenerate corpus is a fair
+    // thing to measure, but not a fair thing to assert this about.
+    let words = [
+        "buscador",
+        "indice",
+        "invertido",
+        "posicional",
+        "rastreo",
+        "robots",
+        "frontera",
+        "ancla",
+        "relevancia",
+        "consulta",
+        "termino",
+        "documento",
+        "segmento",
+        "bloque",
+        "salto",
+        "postings",
+        "ranking",
+        "autoridad",
+        "distribuido",
+        "fragmento",
+        "cortesia",
+        "latencia",
+        "memoria",
+        "disco",
+    ];
     let mut builder = SegmentBuilder::new();
     let mut raw = 0usize;
     for i in 0..500 {
-        let doc = Document::new(
-            format!("doc://{i}"),
-            format!("documento numero {i}"),
-            "el robeiro rastrea la web colombiana y el indexander la indexa \
-             palabra por palabra guardando posiciones y relevancia",
-        );
+        // A different slice of the vocabulary per document.
+        let body: String = (0..30)
+            .map(|w| words[(i * 7 + w * 13) % words.len()])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let doc = Document::new(format!("doc://{i}"), format!("documento numero {i}"), body);
         raw += doc.title.len() + doc.body.len() + doc.uri.len();
         builder.add(&doc);
     }

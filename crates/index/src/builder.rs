@@ -16,6 +16,8 @@ use std::path::Path;
 
 use indexander_core::{DocId, Document, Field, Position, Result};
 
+use crate::scoring::{authority, length_norm, saturation};
+
 use crate::codec::{write_deltas, write_varint};
 use crate::segment::{FOOTER_LEN, MAGIC, SKIP_INTERVAL, VERSION};
 use crate::tokenizer::tokenize_into;
@@ -43,6 +45,30 @@ struct StoredDoc {
     /// recomputed because ranking a query must not depend on the whole graph
     /// being in memory.
     rank: f32,
+}
+
+/// The most one posting can contribute to a score, with the `idf` left out.
+///
+/// Leaving `idf` out is what keeps a stored bound correct when the query
+/// supplies a different one, which it does whenever this segment is one shard
+/// of several: `idf` is a positive factor common to every document in a
+/// postings list, so `idf * max(rest)` still bounds `idf * rest` for all of
+/// them. Authority is folded in, because it multiplies the whole score.
+#[allow(clippy::cast_precision_loss)]
+fn posting_bound(
+    occurrences: &DocOccurrences,
+    meta: &StoredDoc,
+    average_length: f32,
+    doc_count: usize,
+) -> f32 {
+    let weighted: f32 = occurrences
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| Field::ALL[i].weight() * f.positions.len() as f32)
+        .sum();
+    let norm = length_norm(meta.lengths.iter().sum(), average_length);
+    saturation(weighted, norm) * authority(meta.rank, doc_count)
 }
 
 /// Accumulates documents and produces a segment.
@@ -170,8 +196,26 @@ impl SegmentBuilder {
     /// If the term dictionary alone would exceed 4 GiB, which the fixed-width
     /// offset table cannot address.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
+
+        // Needed to compute block bounds, and only knowable once every
+        // document is in: which is why bounds are written, not computed live.
+        let doc_count = self.docs.len();
+        // Computed exactly as `Segment::average_document_length` does. A bound
+        // derived from a different average is not a bound, and the failure
+        // mode is a result quietly missing from a ranking.
+        #[allow(clippy::cast_precision_loss)]
+        let average_length = if doc_count == 0 {
+            0.0
+        } else {
+            self.docs
+                .iter()
+                .map(|d| d.lengths.iter().sum::<u32>() as f32)
+                .sum::<f32>()
+                / doc_count as f32
+        };
 
         // --- postings block -------------------------------------------------
         let postings_offset = out.len() as u64;
@@ -192,17 +236,34 @@ impl SegmentBuilder {
             // delta, which is what makes it independently decodable and so
             // what makes jumping to it possible at all.
             let mut body: Vec<u8> = Vec::new();
-            let mut blocks: Vec<(u32, u64)> = Vec::new();
+            let mut blocks: Vec<(u32, u64, f32)> = Vec::new();
             let mut previous_doc = 0u32;
 
             for (position, (doc_id, occurrences)) in docs.iter().enumerate() {
                 if position % SKIP_INTERVAL == 0 {
-                    blocks.push((doc_id.0, body.len() as u64));
+                    blocks.push((doc_id.0, body.len() as u64, 0.0));
                     write_varint(u64::from(doc_id.0), &mut body);
                 } else {
                     write_varint(u64::from(doc_id.0 - previous_doc), &mut body);
                 }
                 previous_doc = doc_id.0;
+
+                // The most this posting could contribute, minus the `idf`.
+                //
+                // Leaving `idf` out is what keeps the bound correct when the
+                // query supplies a different one, which it does whenever this
+                // segment is a shard: `idf` is a positive factor common to
+                // every document in the list, so `idf * max(rest)` still
+                // bounds `idf * rest` for every one of them.
+                //
+                // Authority is folded in, because it multiplies the score.
+                if let Some(meta) = self.docs.get(doc_id.as_usize()) {
+                    let bound = posting_bound(occurrences, meta, average_length, doc_count);
+                    if let Some(last) = blocks.last_mut() {
+                        last.2 = last.2.max(bound);
+                    }
+                }
+
                 let out = &mut body;
 
                 let present = occurrences
@@ -229,9 +290,10 @@ impl SegmentBuilder {
             }
 
             write_varint(blocks.len() as u64, &mut out);
-            for (first_doc, at) in &blocks {
+            for (first_doc, at, bound) in &blocks {
                 write_varint(u64::from(*first_doc), &mut out);
                 write_varint(*at, &mut out);
+                out.extend_from_slice(&bound.to_le_bytes());
             }
             out.extend_from_slice(&body);
             term_meta.push((offset, docs.len() as u64));

@@ -40,7 +40,7 @@ use indexander_core::{DocId, Error, Field, Position, Result};
 use crate::codec::{read_deltas, read_varint};
 
 pub(crate) const MAGIC: &[u8; 4] = b"IXDR";
-pub(crate) const VERSION: u32 = 4;
+pub(crate) const VERSION: u32 = 5;
 /// Postings per skip block.
 ///
 /// Small enough that decoding one block to find a document is cheap; large
@@ -388,11 +388,17 @@ impl Segment {
             let first_doc = u32::try_from(read_varint(&self.bytes, &mut cursor)?)
                 .map_err(|_| Error::Corrupt("block start exceeds u32".into()))?;
             let at = read_varint(&self.bytes, &mut cursor)? as usize;
-            blocks.push((first_doc, at));
+            let bound: [u8; 4] = self
+                .bytes
+                .get(cursor..cursor + 4)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| Error::Corrupt("skip index ends mid-bound".into()))?;
+            cursor += 4;
+            blocks.push((first_doc, at, f32::from_le_bytes(bound)));
         }
         // Offsets in the header are relative to the body, which begins here.
         let body = cursor;
-        for (_, at) in &mut blocks {
+        for (_, at, _) in &mut blocks {
             *at += body;
             if *at > self.bytes.len() {
                 return Err(Error::Corrupt("skip offset runs past end".into()));
@@ -491,7 +497,13 @@ impl Segment {
 
 /// How a term's postings are laid out: how many documents, where the body
 /// starts, and `(first document, byte offset)` for each skip block.
-type TermLayout = (usize, usize, Vec<(u32, usize)>);
+/// `(first document, byte offset, score bound)` for one skip block.
+///
+/// The bound is the largest contribution any posting in the block can make,
+/// with the `idf` factored out — see `SegmentBuilder::encode` for why.
+pub type Block = (u32, usize, f32);
+
+type TermLayout = (usize, usize, Vec<Block>);
 
 /// A forward-only cursor over one term's postings, able to skip.
 ///
@@ -508,7 +520,7 @@ pub struct PostingsCursor<'a> {
     segment: &'a Segment,
     doc_count: usize,
     /// `(first document, absolute byte offset)` for each block.
-    blocks: Vec<(u32, usize)>,
+    blocks: Vec<Block>,
     want_positions: bool,
     /// Byte offset of the posting the cursor is sitting on.
     at: usize,
@@ -565,10 +577,45 @@ impl<'a> PostingsCursor<'a> {
         self.blocks.len()
     }
 
-    /// The document each block starts at.
+    /// The skip blocks: where each starts and what it can contribute.
     #[must_use]
-    pub fn block_starts(&self) -> &[(u32, usize)] {
+    pub fn block_starts(&self) -> &[Block] {
         &self.blocks
+    }
+
+    /// The most any posting in the current block can contribute to a score,
+    /// before the query's `idf` is applied.
+    ///
+    /// `f32::INFINITY` when the cursor is past the end, so a caller that
+    /// forgets to check for exhaustion never skips something it should read.
+    #[must_use]
+    pub fn block_bound(&self) -> f32 {
+        if self.exhausted {
+            return f32::INFINITY;
+        }
+        self.blocks
+            .get(self.current_block())
+            .map_or(f32::INFINITY, |(_, _, bound)| *bound)
+    }
+
+    /// Jumps to the first posting of the next block.
+    ///
+    /// This is what a bound buys: the whole block goes unread.
+    pub fn skip_block(&mut self) -> Result<()> {
+        if self.exhausted {
+            return Ok(());
+        }
+        let next = self.current_block() + 1;
+        if let Some(&(first_doc, at, _)) = self.blocks.get(next) {
+            self.at = at;
+            self.index = next * SKIP_INTERVAL;
+            self.doc = first_doc;
+            self.jumps += 1;
+            self.read_here(true)
+        } else {
+            self.exhausted = true;
+            Ok(())
+        }
     }
 
     /// How many documents contain this term.
@@ -638,13 +685,13 @@ impl<'a> PostingsCursor<'a> {
         // predecessor cannot hold the target, and its successor starts past it.
         let candidate = self
             .blocks
-            .partition_point(|(first, _)| *first <= target.0)
+            .partition_point(|(first, _, _)| *first <= target.0)
             .saturating_sub(1);
         let block_index = candidate * SKIP_INTERVAL;
 
         // Only jump forward: the cursor may already be inside a later block.
         if block_index > self.index {
-            let (first_doc, at) = self.blocks[candidate];
+            let (first_doc, at, _) = self.blocks[candidate];
             self.at = at;
             self.index = block_index;
             self.doc = first_doc;

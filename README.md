@@ -33,10 +33,10 @@ language and the ranking are real and tested end to end.
 | | |
 |---|---|
 | Indexing | 702 MiB of text into a 222 MiB index in 9.5–15.2 s on 14 threads, from 52.9–61.4 s on one |
-| Index size | 34% of the text it indexes |
-| Query latency | 24 µs to 570 µs over 103,257 documents; a four-term query, 170 µs |
+| Index size | 35% of the text it indexes |
+| Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 202, including full crawls and eight-shard queries over real sockets |
+| Tests | 212, including full crawls and eight-shard queries over real sockets |
 | Memory | 32 MB resident to serve a 236 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -241,6 +241,31 @@ inode alone, so a shard that has a segment mapped keeps a valid mapping until it
 lets go, and a reader never sees a half-written file either.
 `rewriting_a_segment_does_not_disturb_an_open_one` maps a segment, replaces the
 file underneath it, and asserts both of those.
+
+**A block nobody can win from goes unread.** Beside each skip block sits an
+upper bound on what any posting in it can contribute to a score. Once the
+top-k is full, a query adds up the bounds of the blocks its cursors are in;
+if the sum cannot reach the k-th best score so far, the whole block is skipped
+without being decoded.
+
+| query | skip lists | with block bounds |
+|---|---|---|
+| `the`, in 29% of documents | 570 µs | **135 µs** |
+| `index`, in 16% | — | **83 µs** |
+| four terms, one common | 170 µs | 155 µs |
+
+That last row is the point, and it was measured before any of this was built:
+block-max does **nothing** for multi-term queries here, because the leapfrog
+has already discarded everything discardable. It was built anyway because
+single-term queries were the slowest thing left, and it makes them four times
+faster. [`docs/BLOCK-MAX.md`](docs/BLOCK-MAX.md) has the experiment, including
+the two ways it was measured wrong first.
+
+The bound is stored with the `idf` factored out, which is what keeps it correct
+when a shard is told to score with corpus-wide statistics instead of its own:
+`idf` is a positive factor common to every document in a list, so `idf ×
+max(rest)` still bounds every one of them. It costs one `f32` per 128 postings
+— 2.1% of the index.
 
 **A query costs what its rarest term costs.** Postings are written in blocks of
 128 with a skip index in front, and a phrase-free query answers by leapfrogging

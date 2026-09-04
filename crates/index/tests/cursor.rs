@@ -248,3 +248,103 @@ fn a_limit_smaller_than_the_matches_keeps_the_best() {
     assert_eq!(top.len(), 3);
     assert_eq!(top, all[..3]);
 }
+
+// --- block-max -----------------------------------------------------------
+
+/// Skipping a block must never change an answer.
+///
+/// A wrong bound does not crash and does not look wrong: it silently drops a
+/// document that should have ranked. The only defence is comparing against a
+/// search that cannot skip, over enough queries and enough limits to hit the
+/// boundary cases — which is what this does.
+#[test]
+fn block_skipping_never_changes_a_result() {
+    let s = segment(4000);
+
+    // A limit of 1 makes the threshold rise fastest and so skips most; a limit
+    // past the match count means nothing can ever be skipped.
+    for limit in [1usize, 2, 5, 10, 100, 10_000] {
+        for text in [
+            "comun",
+            "septimo",
+            "raro",
+            "titulo",
+            "comun septimo",
+            "comun -raro",
+        ] {
+            let parsed = query::parse(text);
+            let got = search(&s, &parsed, limit).expect("search");
+
+            // The same query with the bound disabled: ask for everything, which
+            // keeps the threshold at zero, then take the top `limit`.
+            let mut all = search(&s, &parsed, usize::MAX).expect("search");
+            all.truncate(limit);
+
+            assert_eq!(got, all, "limit {limit}, query {text:?}");
+        }
+    }
+}
+
+/// A bound must never exceed what the documents in its block actually score.
+///
+/// Checked directly rather than through results, because a bound that is too
+/// low only shows up as a missing result in the exact query that would have
+/// found it.
+#[test]
+fn no_block_bound_is_lower_than_its_contents() {
+    use indexander_index::scoring::{length_norm, saturation};
+
+    let s = segment(3000);
+    let average = s.average_document_length();
+
+    for term in ["comun", "septimo", "raro", "titulo"] {
+        let mut cursor = s.cursor(term, false).expect("cursor");
+        let bounds: Vec<f32> = cursor
+            .block_starts()
+            .iter()
+            .map(|(_, _, bound)| *bound)
+            .collect();
+
+        while let Some(doc) = cursor.doc() {
+            let block = cursor.current_block();
+            let meta = s.doc(doc).expect("doc");
+            let actual = saturation(
+                cursor.weighted_frequency(),
+                length_norm(meta.total_length(), average),
+            );
+            let bound = bounds[block];
+            assert!(
+                bound >= actual - 1e-6,
+                "block {block} of {term:?} bounds {bound} but doc {doc} scores {actual}"
+            );
+            cursor.advance().expect("advance");
+        }
+    }
+}
+
+#[test]
+fn skip_block_lands_on_the_next_block() {
+    let s = segment(2000);
+    let mut cursor = s.cursor("comun", false).expect("cursor");
+    let starts: Vec<u32> = cursor.block_starts().iter().map(|(d, _, _)| *d).collect();
+    assert!(starts.len() > 3, "need several blocks");
+
+    for expected in starts.iter().skip(1) {
+        cursor.skip_block().expect("skip");
+        assert_eq!(cursor.doc(), Some(DocId(*expected)));
+    }
+    // Skipping past the last block exhausts the cursor.
+    cursor.skip_block().expect("skip");
+    assert_eq!(cursor.doc(), None);
+    cursor.skip_block().expect("skip past the end");
+    assert_eq!(cursor.doc(), None);
+}
+
+#[test]
+fn an_exhausted_cursor_bounds_at_infinity() {
+    // So a caller that forgets to check exhaustion can never skip wrongly.
+    let s = segment(300);
+    let mut cursor = s.cursor("raro", false).expect("cursor");
+    cursor.seek(DocId(u32::MAX)).expect("seek");
+    assert!(cursor.block_bound().is_infinite());
+}

@@ -68,12 +68,36 @@ which is what the algorithm actually does — and is the figure in the table
 above. For `the` the two are 97% and 88%; the gap is what a smarter traversal
 order, scoring likely winners first, could recover.
 
-## Verdict
+## Verdict, and what happened when it was built
 
-Worth building, for the case it addresses and no other. It should be described
-that way in the README when it lands: a single-term query optimisation, not a
-general one.
+Worth building, for the case it addresses and no other.
 
-The place to put the bound is beside the skip index, one `f32` per block per
-term — about 4 bytes per 128 postings, which on this index is under half a
-percent.
+It was built, in segment format v5: one `f32` per block, beside the skip index,
+holding the largest contribution any posting in the block can make with the
+`idf` factored out. What the prediction was worth:
+
+| query | predicted skip | before | after | speedup |
+|---|---|---|---|---|
+| `the` | 88% | 570 µs | 135 µs | 4.2× |
+| `index` | 86% | — | 83 µs | — |
+| `kubernetes the` | 0% | 62 µs | 56 µs | none |
+| `index the control plane` | 0% | 170 µs | 155 µs | none |
+
+The prediction held on both sides: large for one term, nothing for several.
+The index grew 2.1% rather than the half percent estimated here, because the
+bound is one `f32` per block and blocks are 128 postings, not the 1,000 that
+estimate assumed.
+
+Two things the build itself turned up, neither predicted by the experiment:
+
+- **The bound has to leave `idf` out.** Baking it in would have been correct
+  for a single index and silently wrong for a shard, which is told to score
+  with corpus-wide statistics instead of its own. A bound computed with the
+  wrong `idf` does not fail — it drops results.
+- **The bound has to use the same average document length the searcher uses.**
+  The first version computed its own, slightly differently, which would have
+  made some bounds too low and lost results in exactly the queries that would
+  have found them.
+
+Both are the same failure in different clothes: a bound derived from a
+different formula than the one that scores is not a bound.
