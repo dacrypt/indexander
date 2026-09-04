@@ -61,6 +61,18 @@ A node with a URL to fetch requests a **fetch lease** from the host's
 politeness owner. Leases are the only cross-node chatter in the crawl, they are
 small, and they batch: ask for twenty, fetch twenty.
 
+**A slot crosses the wire as a relative wait, and that costs jitter.** The
+authority computes an absolute moment on its own clock and sends "in N
+milliseconds"; the asker turns that back into an absolute moment using its
+clock, after the reply arrives. The difference in round-trip time between two
+requests lands directly in the difference between the two reconstructed
+moments, so a crawler can fire a millisecond or two early. Nothing removes
+this — transferring an instant between two processes costs the jitter between
+them — and it does not compound, because the authority's own reservations
+never overlap and each is computed fresh. The milliseconds on the wire are
+rounded **up** for the same reason: truncating grants a slot early, and early
+is the direction that abuses a site.
+
 As built, the authority hands out slots and nothing else. It does not fetch
 `robots.txt` and does not know what a host asked for: the crawler supplies the
 delay it read from that host's `Crawl-delay`, and the authority grants the

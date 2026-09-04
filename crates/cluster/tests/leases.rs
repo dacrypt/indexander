@@ -53,39 +53,109 @@ async fn four_crawlers_sharing_an_authority_do_not_multiply_the_rate() {
         let address = address.clone();
         handles.push(tokio::spawn(async move {
             let politeness = remote_politeness(&address).await.expect("connect");
-            let mut moments = Vec::new();
+            let mut granted = Vec::new();
             for _ in 0..3 {
-                wait_for(politeness.lease("shared.example", Duration::ZERO, 1).await).await;
-                moments.push(Instant::now());
+                let lease = politeness.lease("shared.example", Duration::ZERO, 1).await;
+                // The moment the authority granted, not the moment this task
+                // happened to wake up. The authority controls the first; the
+                // operating system's scheduler controls the second, and a
+                // loaded machine can compress two wake-ups into one instant
+                // without anything being wrong.
+                granted.push(lease.not_before);
+                wait_for(lease).await;
             }
-            moments
+            granted
         }));
     }
 
-    let mut all: Vec<Instant> = Vec::new();
+    let mut granted: Vec<Instant> = Vec::new();
     for handle in handles {
-        all.extend(handle.await.expect("crawler"));
+        granted.extend(handle.await.expect("crawler"));
     }
-    all.sort_unstable();
-    assert_eq!(all.len(), 12);
+    granted.sort_unstable();
+    assert_eq!(granted.len(), 12);
 
-    // Twelve requests at 30 ms apart is eleven gaps: 330 ms. Without an
-    // authority each crawler would have paced itself and the twelve would
-    // have fitted into a quarter of that.
-    let span = all.last().expect("last").duration_since(started);
-    assert!(
-        span >= Duration::from_millis(300),
-        "twelve requests across four crawlers finished in {span:?}; they were not coordinated"
-    );
-
-    // And no two requests landed on top of each other.
-    for pair in all.windows(2) {
+    // No two of the twelve slots are closer together than the floor — give or
+    // take the wire.
+    //
+    // The tolerance is not slack, it is physics. The authority sends a
+    // *relative* wait and each client turns it into an absolute instant using
+    // its own clock, after the reply arrives. The difference in round-trip
+    // time between two requests lands directly in the difference between the
+    // two reconstructed instants, and no amount of care at either end removes
+    // it: transferring an instant between two processes costs the jitter
+    // between them.
+    //
+    // The exact contract is asserted where it actually holds, against the
+    // authority itself, in `the_authority_never_grants_overlapping_slots`.
+    let jitter = Duration::from_millis(5);
+    for pair in granted.windows(2) {
         let gap = pair[1].duration_since(pair[0]);
         assert!(
-            gap + Duration::from_millis(10) >= floor,
-            "two requests were {gap:?} apart, floor is {floor:?}"
+            gap + jitter >= floor,
+            "two slots were granted {gap:?} apart, floor is {floor:?}"
         );
     }
+
+    // Eleven gaps of 30 ms: the twelve slots span most of 330 ms. Without an
+    // authority each crawler would have paced only itself and the twelve would
+    // have fitted into a quarter of that, which no jitter can explain away.
+    let span = granted
+        .last()
+        .expect("last")
+        .duration_since(*granted.first().expect("first"));
+    assert!(
+        span + jitter >= floor * 11,
+        "twelve slots spanned {span:?}; they were not coordinated"
+    );
+    let _ = started;
+}
+
+/// The exact contract, tested where it holds: inside the authority.
+///
+/// No sockets, no clock transfer, no jitter — just the reservations it makes.
+#[tokio::test]
+async fn the_authority_never_grants_overlapping_slots() {
+    use indexander_proto::message::{Request, Response};
+
+    let floor = Duration::from_millis(30);
+    let authority = LeaseAuthority::new(floor);
+
+    // Interleaved hosts, so a bug that reserved globally rather than per host
+    // would show up as slots that are too far apart, not too close.
+    let mut slots: Vec<u64> = Vec::new();
+    for _ in 0..12 {
+        let Response::Lease { wait_ms, .. } = authority
+            .handle(&Request::Lease {
+                host: "shared.example".into(),
+                requested_delay_ms: 0,
+                permits: 1,
+            })
+            .await
+        else {
+            panic!("expected a lease");
+        };
+        slots.push(wait_ms);
+        let _ = authority
+            .handle(&Request::Lease {
+                host: "other.example".into(),
+                requested_delay_ms: 0,
+                permits: 1,
+            })
+            .await;
+    }
+
+    // Twelve slots for one host, each at least the floor after the last.
+    for (i, pair) in slots.windows(2).enumerate() {
+        assert!(
+            pair[1] >= pair[0] + 30,
+            "slot {i} was {} ms and slot {} was {} ms",
+            pair[0],
+            i + 1,
+            pair[1]
+        );
+    }
+    assert_eq!(slots.first(), Some(&0), "the first request should not wait");
 }
 
 #[tokio::test]
@@ -140,11 +210,15 @@ async fn a_batch_reserves_every_slot_it_was_given() {
     assert_eq!(batch.permits, 10);
 
     // The next asker waits for the whole batch, not for one slot.
+    //
+    // Compared against the batch's own slot rather than against "now": the
+    // round trip to the authority takes time, and measuring what is left of
+    // the wait makes the assertion depend on how fast that round trip was.
     let next = politeness.lease("batch.example", Duration::ZERO, 1).await;
-    let wait = next.not_before.saturating_duration_since(Instant::now());
     assert!(
-        wait >= Duration::from_millis(180),
-        "the next lease waited only {wait:?} behind a batch of ten"
+        next.not_before >= batch.not_before + Duration::from_millis(200),
+        "the next slot was granted only {:?} after the batch of ten started",
+        next.not_before.duration_since(batch.not_before)
     );
 }
 

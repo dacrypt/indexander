@@ -22,6 +22,17 @@ use tokio::sync::mpsc;
 
 use crate::frame::{read_frame, read_hello, write_frame, write_hello};
 
+/// Milliseconds, rounded up.
+///
+/// The wire carries whole milliseconds and `as_millis` truncates, which grants
+/// a slot slightly *earlier* than the authority computed. Sub-millisecond on
+/// one lease, but it is the wrong direction: it compounds across a crawl into
+/// a rate above what the site asked for, which is the exact thing this whole
+/// mechanism exists to prevent. Waiting a fraction too long is always safe.
+fn millis_rounding_up(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
 /// Serves lease requests for whichever hosts are routed here.
 #[derive(Debug)]
 pub struct LeaseAuthority {
@@ -54,9 +65,9 @@ impl LeaseAuthority {
                     .not_before
                     .saturating_duration_since(std::time::Instant::now());
                 Response::Lease {
-                    wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                    wait_ms: millis_rounding_up(wait),
                     permits: lease.permits,
-                    spacing_ms: u64::try_from(lease.spacing.as_millis()).unwrap_or(u64::MAX),
+                    spacing_ms: millis_rounding_up(lease.spacing),
                 }
             }
             other => Response::Error {
