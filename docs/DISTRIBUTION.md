@@ -221,8 +221,12 @@ error names every address that was tried.
    that decides what to fold next. `indexander merge` does the merges,
    restartably: the new segment is written before the manifest is replaced, so
    an interrupted merge leaves an unreferenced file rather than a broken index.
-   What is missing is what calls it on a schedule, and telling a shard's other
-   replicas that the manifest changed.
+   `indexander merge --every` runs it on a
+   schedule, and `indexander sync` brings a replica into line by manifest —
+   fetching only the segments it lacks, and installing the manifest last so an
+   interrupted sync leaves the replica serving what it was. What is missing is
+   a *push*: a primary that has just merged does not tell its replicas, they
+   have to be asked to look.
 
 Step 1 is most of the value: it is what stops the single-process assumption
 from being baked into another year of code.

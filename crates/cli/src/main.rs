@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use indexander_cluster::coordinator::Coordinator;
 use indexander_cluster::leases::LeaseAuthority;
+use indexander_cluster::shard::ShardIndex;
 use indexander_core::DocId;
 use indexander_core::Document;
 use indexander_crawl::Config;
@@ -39,7 +40,8 @@ USAGE:
     indexander index <directory> [--out <segment>]
     indexander shard  --listen <addr> [--index <segment>]
     indexander leases --listen <addr> [--floor <ms>]     rate limits + robots.txt
-    indexander merge  <directory> [--per-tier <n>] [--once]
+    indexander merge  <directory> [--per-tier <n>] [--once] [--every <secs>]
+    indexander sync   <directory> --from <addr>
     indexander search <query>... [--index <segment>] [--limit <n>]
                                  [--shards <addr,addr,...>]
     indexander stats [--index <segment>]
@@ -53,7 +55,8 @@ EXAMPLES:
     indexander search '\"inverted index\"' -perl --limit 5
     indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
     indexander leases --listen 127.0.0.1:7900 --floor 1000
-    indexander merge ./index --per-tier 8
+    indexander merge ./index --per-tier 8 --every 60
+    indexander sync ./replica --from 127.0.0.1:7801
     indexander crawl https://example.com --leases 127.0.0.1:7900
     indexander search motor --shards 127.0.0.1:7801,127.0.0.1:7802
 ";
@@ -81,6 +84,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "shard" => cmd_shard(&args[1..]),
         "leases" => cmd_leases(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
+        "sync" => cmd_sync(&args[1..]),
         "index" => cmd_index(&args[1..]),
         "search" => cmd_search(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
@@ -262,12 +266,25 @@ fn cmd_shard(args: &[String]) -> Result<(), String> {
     let (listen, rest) = take_option(args, "--listen");
     let (index, _) = take_option(&rest, "--index");
     let listen = listen.ok_or_else(|| format!("shard needs --listen\n\n{USAGE}"))?;
-    let segment = Arc::new(open_segment(index.as_deref())?);
+    // A directory with a manifest, or a single segment file. A shard that
+    // holds a whole index can serve its segments to a replica by name; one
+    // holding a lone file can only serve itself.
+    let path = std::path::PathBuf::from(index.as_deref().unwrap_or(DEFAULT_SEGMENT));
+    let shard = Arc::new(if path.is_dir() {
+        ShardIndex::open(&path).map_err(|e| format!("opening {}: {e}", path.display()))?
+    } else {
+        ShardIndex::single(open_segment(index.as_deref())?)
+    });
 
     println!(
-        "shard listening on {listen}: {} documents, {} terms",
-        segment.document_count(),
-        segment.term_count()
+        "shard listening on {listen}: {} documents in {} segment{}",
+        shard.index().document_count(),
+        shard.index().segment_count(),
+        if shard.index().segment_count() == 1 {
+            ""
+        } else {
+            "s"
+        }
     );
 
     let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
@@ -275,7 +292,7 @@ fn cmd_shard(args: &[String]) -> Result<(), String> {
         let listener = tokio::net::TcpListener::bind(&listen)
             .await
             .map_err(|e| format!("binding {listen}: {e}"))?;
-        indexander_cluster::shard::serve(listener, segment)
+        indexander_cluster::shard::serve(listener, shard)
             .await
             .map_err(|e| format!("serving: {e}"))
     })
@@ -425,6 +442,7 @@ fn cmd_leases(args: &[String]) -> Result<(), String> {
 /// index nobody can read.
 fn cmd_merge(args: &[String]) -> Result<(), String> {
     let (per_tier, rest) = take_option(args, "--per-tier");
+    let (every, rest) = take_option(&rest, "--every");
     let (once, rest): (Vec<String>, Vec<String>) = rest.into_iter().partition(|a| a == "--once");
     let directory = rest
         .first()
@@ -438,6 +456,30 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
     }
 
     let merger = Merger::new(Path::new(directory), policy);
+
+    // --every turns this into the background merger: the same step, on a
+    // clock. Kept as a loop here rather than a daemon inside the library,
+    // because "how often" is an operational decision and belongs where the
+    // operator can see it.
+    if let Some(seconds) = every {
+        let interval: u64 = seconds
+            .parse()
+            .map_err(|_| "--every needs a number of seconds".to_owned())?;
+        println!("merging {directory} every {interval}s; interrupt to stop");
+        loop {
+            match merger.run_to_completion() {
+                Ok(reports) if !reports.is_empty() => {
+                    println!("{} merge(s)", reports.len());
+                }
+                Ok(_) => {}
+                // A merge that failed leaves the index as it was, so the right
+                // response is to say so and try again rather than to exit.
+                Err(e) => eprintln!("merge failed: {e}"),
+            }
+            std::thread::sleep(Duration::from_secs(interval.max(1)));
+        }
+    }
+
     let started = std::time::Instant::now();
     let reports = if once.is_empty() {
         merger.run_to_completion().map_err(|e| e.to_string())?
@@ -451,6 +493,7 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
 
     if reports.is_empty() {
         println!("nothing to merge");
+        report_orphans(&merger)?;
         return Ok(());
     }
     let mut folded = 0usize;
@@ -474,15 +517,59 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
         started.elapsed()
     );
 
+    report_orphans(&merger)?;
+    Ok(())
+}
+
+/// Names the files in an index directory the manifest does not.
+///
+/// Reported whether or not anything was merged, because the case where it
+/// matters most is the one where nothing was: a replica never merges, and a
+/// sync leaves the segments it replaced behind. Nobody would think to ask.
+fn report_orphans(merger: &Merger) -> Result<(), String> {
     let orphans = merger.orphans().map_err(|e| e.to_string())?;
-    if !orphans.is_empty() {
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "\n{} unreferenced file{} in the directory: {}",
+        orphans.len(),
+        if orphans.len() == 1 { "" } else { "s" },
+        orphans.join(", ")
+    );
+    println!("left in place: whether they are safe to delete depends on who is still reading");
+    Ok(())
+}
+
+/// Brings a replica into line with the index served somewhere else.
+fn cmd_sync(args: &[String]) -> Result<(), String> {
+    let (from, rest) = take_option(args, "--from");
+    let directory = rest
+        .first()
+        .ok_or_else(|| format!("sync needs a directory\n\n{USAGE}"))?;
+    let from = from.ok_or_else(|| format!("sync needs --from\n\n{USAGE}"))?;
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
+    let started = std::time::Instant::now();
+    let fetched = runtime
+        .block_on(indexander_cluster::replication::sync_from(
+            &from,
+            Path::new(directory),
+        ))
+        .map_err(|e| e.to_string())?;
+
+    if fetched.is_empty() {
+        println!("already up to date with {from}");
+    } else {
+        for name in &fetched {
+            println!("  fetched {name}");
+        }
         println!(
-            "\n{} unreferenced file{} in the directory: {}",
-            orphans.len(),
-            if orphans.len() == 1 { "" } else { "s" },
-            orphans.join(", ")
+            "{} segment{} from {from} in {:.2?}",
+            fetched.len(),
+            if fetched.len() == 1 { "" } else { "s" },
+            started.elapsed()
         );
-        println!("left in place: whether they are safe to delete depends on who is still reading");
     }
     Ok(())
 }

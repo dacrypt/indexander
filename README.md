@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 300, including full crawls and eight-shard queries over real sockets |
+| Tests | 303, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -245,6 +245,28 @@ $ indexander merge ./index --per-tier 4
 
 Twenty segments become two, six hundred documents stay six hundred, and the
 directory is left with no files the manifest does not name.
+
+`--every <secs>` turns it into the background merger. It stays a loop in the
+command rather than a daemon inside the library, because how often to merge is
+an operational decision and belongs where an operator can see it.
+
+A replica catches up by manifest:
+
+```console
+$ indexander sync ./replica --from 127.0.0.1:7801
+  fetched 0f037317d9147b98.ixdr
+2 segments from 127.0.0.1:7801 in 36.87ms
+```
+
+It asks what segments the source has, fetches only the ones it is missing, and
+installs the new manifest **last** — so a sync that dies partway leaves the
+replica serving exactly what it was serving. After a merge folds eight segments
+into two, a resync fetches two, not eight.
+
+What it does not do is delete what it replaced. `indexander merge` on a replica
+lists the unreferenced files whether or not anything was merged, because the
+case where that matters most is the one where nothing was: a replica never
+merges, and nobody would think to ask.
 
 **A merge is safe to interrupt**, which matters because on a real index it
 takes minutes. It writes its new segment first, under a name derived from that
@@ -560,9 +582,11 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **Running the merger on a schedule, and replicating a new manifest** to a
-  shard's other copies. `indexander merge` does the work; nothing yet decides
-  when to call it or tells the replicas afterwards.
+- **Telling replicas to sync rather than having them ask.** A replica catches
+  up when `indexander sync` is run; there is no push from a primary that has
+  just merged.
+- **Sweeping orphans.** They are listed, never deleted. Deciding a file is
+  unreferenced is easy; deciding nobody is still reading it is not.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
 - **Block-max scoring.** Blocks are skipped when no document in them can

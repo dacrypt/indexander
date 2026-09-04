@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use indexander_cluster::coordinator::Coordinator;
-use indexander_cluster::shard;
+use indexander_cluster::shard::{self, ShardIndex};
 use indexander_core::Document;
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::query;
@@ -53,9 +53,9 @@ fn segment_of(docs: &[Document]) -> Segment {
 async fn start(docs: &[Document]) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("addr").to_string();
-    let segment = Arc::new(segment_of(docs));
+    let shard = Arc::new(ShardIndex::single(segment_of(docs)));
     tokio::spawn(async move {
-        let _ = shard::serve(listener, segment).await;
+        let _ = shard::serve(listener, shard).await;
     });
     address
 }

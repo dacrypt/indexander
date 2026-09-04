@@ -77,15 +77,22 @@ pub enum Request {
         state: u8,
         text: String,
     },
-    /// What segment are you serving, and how big is it?
+    /// What segments make up your index?
     ///
-    /// The digest is what makes a copy checkable: a replica that fetched the
-    /// bytes and got a different digest fetched something else.
-    SegmentInfo,
-    /// Send me `len` bytes of your segment starting at `offset`.
+    /// The reply is the manifest as text — the same bytes on disk, so a
+    /// replica can write what it was given rather than re-render it.
+    Manifest,
+    /// What is this segment's digest, and how big is it?
+    ///
+    /// An empty `name` means "the one you serve", which is what a shard
+    /// holding a single segment answers. The digest is what makes a copy
+    /// checkable: a replica that fetched the bytes and got a different digest
+    /// fetched something else.
+    SegmentInfo { name: String },
+    /// Send me `len` bytes of a segment starting at `offset`.
     ///
     /// Chunked because a segment is hundreds of megabytes and a frame is not.
-    SegmentChunk { offset: u64, len: u32 },
+    SegmentChunk { name: String, offset: u64, len: u32 },
     /// May I make `permits` requests to `host`?
     ///
     /// Sent to whichever node owns that host's rate limit, which is a
@@ -130,6 +137,10 @@ pub enum Response {
         permits: usize,
         /// The gap to leave between the granted requests.
         spacing_ms: u64,
+    },
+    /// Answer to [`Request::Manifest`].
+    Manifest {
+        text: String,
     },
     /// Answer to [`Request::Robots`]: 0 unknown, 1 rules, 2 unreachable.
     Robots {
@@ -193,6 +204,7 @@ const REQ_RANK_RESULTS: u8 = 10;
 const REQ_SEGMENT_INFO: u8 = 11;
 const REQ_SEGMENT_CHUNK: u8 = 12;
 const REQ_ROBOTS: u8 = 13;
+const REQ_MANIFEST: u8 = 14;
 
 const RES_TERM_STATS: u8 = 1;
 const RES_HITS: u8 = 2;
@@ -207,6 +219,7 @@ const RES_OK: u8 = 10;
 const RES_SEGMENT_INFO: u8 = 11;
 const RES_SEGMENT_CHUNK: u8 = 12;
 const RES_ROBOTS: u8 = 13;
+const RES_MANIFEST: u8 = 14;
 
 impl Request {
     #[must_use]
@@ -288,9 +301,14 @@ impl Request {
                 w.u8(*state);
                 w.str(text);
             }
-            Self::SegmentInfo => w.u8(REQ_SEGMENT_INFO),
-            Self::SegmentChunk { offset, len } => {
+            Self::Manifest => w.u8(REQ_MANIFEST),
+            Self::SegmentInfo { name } => {
+                w.u8(REQ_SEGMENT_INFO);
+                w.str(name);
+            }
+            Self::SegmentChunk { name, offset, len } => {
                 w.u8(REQ_SEGMENT_CHUNK);
+                w.str(name);
                 w.varint(*offset);
                 w.varint(u64::from(*len));
             }
@@ -361,8 +379,10 @@ impl Request {
                 state: r.u8()?,
                 text: r.string()?,
             },
-            REQ_SEGMENT_INFO => Self::SegmentInfo,
+            REQ_MANIFEST => Self::Manifest,
+            REQ_SEGMENT_INFO => Self::SegmentInfo { name: r.string()? },
             REQ_SEGMENT_CHUNK => Self::SegmentChunk {
+                name: r.string()?,
                 offset: r.varint()?,
                 len: u32::try_from(r.varint()?)
                     .map_err(|_| indexander_core::Error::Corrupt("chunk too large".into()))?,
@@ -451,6 +471,10 @@ impl Response {
                     w.str(uri);
                     w.f32(*score);
                 }
+            }
+            Self::Manifest { text } => {
+                w.u8(RES_MANIFEST);
+                w.str(text);
             }
             Self::Robots { state, text } => {
                 w.u8(RES_ROBOTS);
@@ -543,6 +567,7 @@ impl Response {
                 }
                 Self::RankResults { ranks }
             }
+            RES_MANIFEST => Self::Manifest { text: r.string()? },
             RES_ROBOTS => Self::Robots {
                 state: r.u8()?,
                 text: r.string()?,
@@ -610,8 +635,15 @@ mod tests {
             state: 1,
             text: "User-agent: *\nDisallow: /ñ".into(),
         });
-        roundtrip_request(&Request::SegmentInfo);
+        roundtrip_request(&Request::Manifest);
+        roundtrip_request(&Request::SegmentInfo {
+            name: String::new(),
+        });
+        roundtrip_request(&Request::SegmentInfo {
+            name: "44906b3a549fc495.ixdr".into(),
+        });
         roundtrip_request(&Request::SegmentChunk {
+            name: "flush000.ixdr".into(),
             offset: 1 << 40,
             len: 65536,
         });
@@ -662,6 +694,9 @@ mod tests {
                 spacing_ms: 500,
             },
             Response::Ok,
+            Response::Manifest {
+                text: "indexander-manifest 1\nsegments 0\n".into(),
+            },
             Response::Robots {
                 state: 1,
                 text: "User-agent: *".into(),

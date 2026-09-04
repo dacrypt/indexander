@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use indexander_core::{Error, Result};
+use indexander_index::manifest::Manifest;
 use indexander_index::segment::Segment;
 use indexander_proto::message::{PROTOCOL_VERSION, Request, Response};
 use tokio::io::AsyncWriteExt;
@@ -45,13 +46,23 @@ pub struct SegmentInfo {
 /// leaves no half-segment anybody could open — the same reason
 /// `SegmentBuilder::write_to` renames rather than truncating.
 pub async fn fetch_segment(address: &str, destination: &Path) -> Result<SegmentInfo> {
+    fetch_named(address, "", destination).await
+}
+
+/// Pulls one named segment from `address` into `destination`.
+///
+/// An empty name means "the segment you serve", which is what a shard holding
+/// a single one answers about itself.
+pub async fn fetch_named(address: &str, name: &str, destination: &Path) -> Result<SegmentInfo> {
     let mut stream = TcpStream::connect(address).await?;
     let _ = stream.set_nodelay(true);
     read_hello(&mut stream, PROTOCOL_VERSION).await?;
     write_hello(&mut stream, PROTOCOL_VERSION).await?;
 
-    let Response::SegmentInfo { digest, len } = call(&mut stream, &Request::SegmentInfo).await?
-    else {
+    let info = Request::SegmentInfo {
+        name: name.to_owned(),
+    };
+    let Response::SegmentInfo { digest, len } = call(&mut stream, &info).await? else {
         return Err(Error::Corrupt(format!(
             "{address} did not answer what segment it serves"
         )));
@@ -66,6 +77,7 @@ pub async fn fetch_segment(address: &str, destination: &Path) -> Result<SegmentI
         let Response::SegmentChunk { bytes } = call(
             &mut stream,
             &Request::SegmentChunk {
+                name: name.to_owned(),
                 offset: fetched,
                 len: want,
             },
@@ -115,6 +127,56 @@ pub async fn fetch_segment(address: &str, destination: &Path) -> Result<SegmentI
     Ok(SegmentInfo { digest, len })
 }
 
+/// Brings `directory` into line with the index served at `address`.
+///
+/// Asks what segments the source has, fetches the ones this copy is missing,
+/// verifies each against the digest the manifest recorded, and installs the
+/// new manifest **last**. Until that rename lands, this replica is still
+/// serving exactly what it was — the same rule a merge follows, for the same
+/// reason.
+///
+/// Returns the names it fetched. Segments already present with the right
+/// digest are not refetched, which is what makes syncing after a merge cost
+/// the merged segment rather than the whole index.
+pub async fn sync_from(address: &str, directory: &Path) -> Result<Vec<String>> {
+    let mut stream = TcpStream::connect(address).await?;
+    let _ = stream.set_nodelay(true);
+    read_hello(&mut stream, PROTOCOL_VERSION).await?;
+    write_hello(&mut stream, PROTOCOL_VERSION).await?;
+
+    let Response::Manifest { text } = call(&mut stream, &Request::Manifest).await? else {
+        return Err(Error::Corrupt(format!("{address} did not send a manifest")));
+    };
+    drop(stream);
+    let wanted = Manifest::decode(&text)?;
+
+    tokio::fs::create_dir_all(directory).await?;
+    let mut fetched = Vec::new();
+    for entry in &wanted.segments {
+        let path = directory.join(&entry.name);
+        // Already here and intact? Then it is the same segment: names come
+        // from digests for merged segments, and the digest is checked anyway.
+        if let Ok(existing) = tokio::fs::read(&path).await {
+            if Segment::from_bytes(existing).is_ok_and(|s| s.digest() == entry.digest) {
+                continue;
+            }
+        }
+        let got = fetch_named(address, &entry.name, &path).await?;
+        if got.digest != entry.digest {
+            return Err(Error::Corrupt(format!(
+                "{} arrived with a digest the manifest does not name",
+                entry.name
+            )));
+        }
+        fetched.push(entry.name.clone());
+    }
+
+    // Last, so a sync that dies partway leaves this replica serving what it
+    // was serving, with some extra files nobody references yet.
+    wanted.write_to(&directory.join("MANIFEST"))?;
+    Ok(fetched)
+}
+
 async fn call(stream: &mut TcpStream, request: &Request) -> Result<Response> {
     write_frame(stream, &request.encode()).await?;
     let payload = read_frame(stream).await?;
@@ -123,31 +185,4 @@ async fn call(stream: &mut TcpStream, request: &Request) -> Result<Response> {
         return Err(Error::Corrupt(message.clone()));
     }
     Ok(response)
-}
-
-/// Answers the two transfer requests from a segment held in memory.
-///
-/// Kept beside the shard role rather than inside it, because serving bytes and
-/// serving queries are different jobs that happen to share a socket.
-#[must_use]
-pub fn handle(segment_bytes: &[u8], segment: &Segment, request: &Request) -> Option<Response> {
-    match request {
-        Request::SegmentInfo => Some(Response::SegmentInfo {
-            digest: segment.digest(),
-            len: segment_bytes.len() as u64,
-        }),
-        Request::SegmentChunk { offset, len } => {
-            let start = usize::try_from(*offset).unwrap_or(usize::MAX);
-            if start >= segment_bytes.len() {
-                // Past the end is an empty chunk, not an error: it is how a
-                // reader learns it has everything.
-                return Some(Response::SegmentChunk { bytes: Vec::new() });
-            }
-            let end = start.saturating_add(*len as usize).min(segment_bytes.len());
-            Some(Response::SegmentChunk {
-                bytes: segment_bytes[start..end].to_vec(),
-            })
-        }
-        _ => None,
-    }
 }

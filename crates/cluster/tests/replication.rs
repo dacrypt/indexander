@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use indexander_cluster::coordinator::Coordinator;
 use indexander_cluster::replication::fetch_segment;
-use indexander_cluster::shard;
+use indexander_cluster::shard::{self, ShardIndex};
 use indexander_core::Document;
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::query;
@@ -46,9 +46,9 @@ fn built() -> SegmentBuilder {
 async fn serve(segment: Segment) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("addr").to_string();
-    let segment = Arc::new(segment);
+    let shard = Arc::new(ShardIndex::single(segment));
     let handle = tokio::spawn(async move {
-        let _ = shard::serve(listener, segment).await;
+        let _ = shard::serve(listener, shard).await;
     });
     (address, handle)
 }
@@ -203,4 +203,144 @@ async fn an_empty_replica_list_is_refused() {
             .await
             .is_err()
     );
+}
+
+// --- syncing a whole index -----------------------------------------------
+
+use indexander_cluster::replication::sync_from;
+use indexander_index::manifest::{Entry, Manifest, Policy};
+use indexander_index::merger::Merger;
+
+/// Writes `parts` segments into a directory and a manifest naming them.
+fn build_index(dir: &std::path::Path, parts: usize) -> Manifest {
+    std::fs::create_dir_all(dir).expect("mkdir");
+    let docs = corpus();
+    let size = docs.len().div_ceil(parts);
+    let mut manifest = Manifest::new();
+    for (i, chunk) in docs.chunks(size).enumerate() {
+        let mut builder = SegmentBuilder::new();
+        for doc in chunk {
+            builder.add(doc);
+        }
+        let bytes = builder.encode();
+        let segment = Segment::from_bytes(bytes.clone()).expect("segment");
+        let name = format!("flush{i:03}.ixdr");
+        std::fs::write(dir.join(&name), &bytes).expect("write");
+        manifest.segments.push(Entry {
+            name,
+            digest: segment.digest(),
+            documents: segment.document_count(),
+            bytes: bytes.len() as u64,
+        });
+    }
+    manifest.write_to(&dir.join("MANIFEST")).expect("manifest");
+    manifest
+}
+
+async fn serve_directory(dir: &std::path::Path) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    let shard = Arc::new(ShardIndex::open(dir).expect("open"));
+    let handle = tokio::spawn(async move {
+        let _ = shard::serve(listener, shard).await;
+    });
+    (address, handle)
+}
+
+#[tokio::test]
+async fn a_replica_syncs_a_whole_index_and_answers_the_same() {
+    let source = scratch("sync-source");
+    let replica = scratch("sync-replica");
+    build_index(&source, 5);
+
+    let (address, task) = serve_directory(&source).await;
+    let fetched = sync_from(&address, &replica).await.expect("sync");
+    assert_eq!(fetched.len(), 5, "expected every segment: {fetched:?}");
+
+    let mirrored = ShardIndex::open(&replica).expect("open replica");
+    let original = ShardIndex::open(&source).expect("open source");
+    assert_eq!(
+        mirrored.index().document_count(),
+        original.index().document_count()
+    );
+    for text in ["motor", "replicas", "\"busqueda distribuido\""] {
+        let parsed = query::parse(text);
+        assert_eq!(
+            mirrored.index().search(&parsed, 10).expect("search"),
+            original.index().search(&parsed, 10).expect("search"),
+            "the replica disagreed on {text:?}"
+        );
+    }
+    task.abort();
+    std::fs::remove_dir_all(&source).ok();
+    std::fs::remove_dir_all(&replica).ok();
+}
+
+#[tokio::test]
+async fn syncing_again_after_a_merge_fetches_only_what_changed() {
+    // The point of syncing by manifest rather than by copying a directory:
+    // after a merge, a replica should pull the merged segment, not the index.
+    let source = scratch("sync-merge-source");
+    let replica = scratch("sync-merge-replica");
+    build_index(&source, 8);
+
+    let (address, task) = serve_directory(&source).await;
+    assert_eq!(sync_from(&address, &replica).await.expect("sync").len(), 8);
+    // Nothing changed: nothing fetched.
+    assert!(
+        sync_from(&address, &replica)
+            .await
+            .expect("sync")
+            .is_empty()
+    );
+    task.abort();
+
+    // Merge at the source, then serve the new index.
+    let merger = Merger::new(
+        &source,
+        Policy {
+            segments_per_tier: 4,
+            ..Policy::default()
+        },
+    );
+    let reports = merger.run_to_completion().expect("merge");
+    assert!(!reports.is_empty());
+
+    let (address, task) = serve_directory(&source).await;
+    let fetched = sync_from(&address, &replica).await.expect("sync");
+    task.abort();
+
+    assert!(
+        fetched.len() < 8,
+        "a sync after a merge refetched the whole index: {fetched:?}"
+    );
+    let mirrored = ShardIndex::open(&replica).expect("open replica");
+    let original = ShardIndex::open(&source).expect("open source");
+    assert_eq!(
+        mirrored.index().document_count(),
+        original.index().document_count()
+    );
+    assert_eq!(
+        mirrored
+            .index()
+            .search(&query::parse("motor"), 10)
+            .expect("search"),
+        original
+            .index()
+            .search(&query::parse("motor"), 10)
+            .expect("search")
+    );
+    std::fs::remove_dir_all(&source).ok();
+    std::fs::remove_dir_all(&replica).ok();
+}
+
+#[tokio::test]
+async fn a_sync_that_cannot_reach_the_source_installs_nothing() {
+    let replica = scratch("sync-dead");
+    assert!(sync_from("127.0.0.1:1", &replica).await.is_err());
+    assert!(
+        !replica.join("MANIFEST").exists(),
+        "a failed sync installed a manifest"
+    );
+    std::fs::remove_dir_all(&replica).ok();
 }
