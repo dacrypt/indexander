@@ -66,6 +66,17 @@ pub enum Request {
     RankApply { global_dangling: f32 },
     /// Give me your ranks; the run is over.
     RankResults,
+    /// What is known about this host's `robots.txt`?
+    ///
+    /// `learned` empty means the asker is asking; otherwise it is reporting
+    /// what it fetched so nobody else has to. `state` is 0 unknown, 1 rules,
+    /// 2 unreachable.
+    Robots {
+        host: String,
+        learned: bool,
+        state: u8,
+        text: String,
+    },
     /// What segment are you serving, and how big is it?
     ///
     /// The digest is what makes a copy checkable: a replica that fetched the
@@ -119,6 +130,11 @@ pub enum Response {
         permits: usize,
         /// The gap to leave between the granted requests.
         spacing_ms: u64,
+    },
+    /// Answer to [`Request::Robots`]: 0 unknown, 1 rules, 2 unreachable.
+    Robots {
+        state: u8,
+        text: String,
     },
     /// Answer to [`Request::SegmentInfo`].
     SegmentInfo {
@@ -176,6 +192,7 @@ const REQ_RANK_APPLY: u8 = 9;
 const REQ_RANK_RESULTS: u8 = 10;
 const REQ_SEGMENT_INFO: u8 = 11;
 const REQ_SEGMENT_CHUNK: u8 = 12;
+const REQ_ROBOTS: u8 = 13;
 
 const RES_TERM_STATS: u8 = 1;
 const RES_HITS: u8 = 2;
@@ -189,6 +206,7 @@ const RES_RANK_RESULTS: u8 = 9;
 const RES_OK: u8 = 10;
 const RES_SEGMENT_INFO: u8 = 11;
 const RES_SEGMENT_CHUNK: u8 = 12;
+const RES_ROBOTS: u8 = 13;
 
 impl Request {
     #[must_use]
@@ -258,6 +276,18 @@ impl Request {
                 w.f32(*global_dangling);
             }
             Self::RankResults => w.u8(REQ_RANK_RESULTS),
+            Self::Robots {
+                host,
+                learned,
+                state,
+                text,
+            } => {
+                w.u8(REQ_ROBOTS);
+                w.str(host);
+                w.u8(u8::from(*learned));
+                w.u8(*state);
+                w.str(text);
+            }
             Self::SegmentInfo => w.u8(REQ_SEGMENT_INFO),
             Self::SegmentChunk { offset, len } => {
                 w.u8(REQ_SEGMENT_CHUNK);
@@ -325,6 +355,12 @@ impl Request {
                 global_dangling: r.f32()?,
             },
             REQ_RANK_RESULTS => Self::RankResults,
+            REQ_ROBOTS => Self::Robots {
+                host: r.string()?,
+                learned: r.u8()? != 0,
+                state: r.u8()?,
+                text: r.string()?,
+            },
             REQ_SEGMENT_INFO => Self::SegmentInfo,
             REQ_SEGMENT_CHUNK => Self::SegmentChunk {
                 offset: r.varint()?,
@@ -416,6 +452,11 @@ impl Response {
                     w.f32(*score);
                 }
             }
+            Self::Robots { state, text } => {
+                w.u8(RES_ROBOTS);
+                w.u8(*state);
+                w.str(text);
+            }
             Self::SegmentInfo { digest, len } => {
                 w.u8(RES_SEGMENT_INFO);
                 w.varint(*digest);
@@ -502,6 +543,10 @@ impl Response {
                 }
                 Self::RankResults { ranks }
             }
+            RES_ROBOTS => Self::Robots {
+                state: r.u8()?,
+                text: r.string()?,
+            },
             RES_SEGMENT_INFO => Self::SegmentInfo {
                 digest: r.varint()?,
                 len: r.varint()?,
@@ -552,6 +597,18 @@ mod tests {
         });
         roundtrip_request(&Request::RankApply {
             global_dangling: 0.125,
+        });
+        roundtrip_request(&Request::Robots {
+            host: "example.com".into(),
+            learned: false,
+            state: 0,
+            text: String::new(),
+        });
+        roundtrip_request(&Request::Robots {
+            host: "example.com".into(),
+            learned: true,
+            state: 1,
+            text: "User-agent: *\nDisallow: /ñ".into(),
         });
         roundtrip_request(&Request::SegmentInfo);
         roundtrip_request(&Request::SegmentChunk {
@@ -605,6 +662,14 @@ mod tests {
                 spacing_ms: 500,
             },
             Response::Ok,
+            Response::Robots {
+                state: 1,
+                text: "User-agent: *".into(),
+            },
+            Response::Robots {
+                state: 2,
+                text: String::new(),
+            },
             Response::SegmentInfo {
                 digest: 0xdead_beef_cafe_f00d,
                 len: 260_000_000,

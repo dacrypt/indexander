@@ -19,6 +19,7 @@ use indexander_core::DocId;
 use indexander_core::Document;
 use indexander_crawl::Config;
 use indexander_crawl::politeness::Politeness;
+use indexander_crawl::robots_cache::RobotsCache;
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::manifest::Policy as MergePolicy;
 use indexander_index::merger::Merger;
@@ -37,7 +38,7 @@ USAGE:
                               [--delay <ms>] [--concurrency <n>] [--any-host]
     indexander index <directory> [--out <segment>]
     indexander shard  --listen <addr> [--index <segment>]
-    indexander leases --listen <addr> [--floor <ms>]
+    indexander leases --listen <addr> [--floor <ms>]     rate limits + robots.txt
     indexander merge  <directory> [--per-tier <n>] [--once]
     indexander search <query>... [--index <segment>] [--limit <n>]
                                  [--shards <addr,addr,...>]
@@ -163,16 +164,9 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     // whole graph. So the crawl builds both, and the ranks are applied at the
     // end, before the segment is written.
     let (mut builder, graph_builder, stats) = runtime.block_on(async {
-        let politeness = match &leases {
-            Some(address) => Arc::new(
-                indexander_cluster::leases::remote_politeness(address)
-                    .await
-                    .map_err(|e| format!("lease authority {address}: {e}"))?,
-            ),
-            None => Arc::new(Politeness::local(config.delay)),
-        };
+        let (politeness, robots) = shared_or_local(leases.as_deref(), config.delay).await?;
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let crawling = indexander_crawl::crawl_with(&config, &seeds, tx, politeness);
+        let crawling = indexander_crawl::crawl_sharing(&config, &seeds, tx, politeness, robots);
         let indexing = async {
             let mut builder = SegmentBuilder::new();
             let mut graph = GraphBuilder::new();
@@ -330,6 +324,39 @@ fn search_cluster(addresses: &[String], query_text: &str, limit: usize) -> Resul
         );
         Ok(())
     })
+}
+
+/// What the crawler should defer to: an authority, or this process.
+///
+/// One address, two shared things — who may fetch from a host next, and what
+/// that host's robots.txt says. They belong together, because whoever owns a
+/// host's rate limit is the natural place to remember what it said about being
+/// crawled, and it means one address per host rather than two.
+async fn shared_or_local(
+    leases: Option<&str>,
+    delay: Duration,
+) -> Result<(Arc<Politeness>, Arc<RobotsCache>), String> {
+    match leases {
+        Some(address) => {
+            let fail = |e: indexander_core::Error| format!("lease authority {address}: {e}");
+            Ok((
+                Arc::new(
+                    indexander_cluster::leases::remote_politeness(address)
+                        .await
+                        .map_err(fail)?,
+                ),
+                Arc::new(
+                    indexander_cluster::leases::remote_robots_cache(address)
+                        .await
+                        .map_err(fail)?,
+                ),
+            ))
+        }
+        None => Ok((
+            Arc::new(Politeness::local(delay)),
+            Arc::new(RobotsCache::default()),
+        )),
+    }
 }
 
 /// Turns the crawl command's numeric options into a config.

@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 288, including full crawls and eight-shard queries over real sockets |
+| Tests | 300, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -340,6 +340,26 @@ so a misconfigured crawler cannot talk the cluster into hammering a site. And
 if the authority disappears, a crawl falls back to its own delay rather than
 stalling — a stopped crawl is worse than a slower one.
 
+It remembers each host's `robots.txt` too. A crawl over fifty nodes otherwise
+fetches every host's `robots.txt` fifty times, and that is the *first* thing
+each node does to a host it has never touched, which makes it the request most
+likely to look like a swarm. Four staggered crawlers against one site:
+
+```
+without an authority   4 requests for robots.txt
+sharing one            1
+```
+
+Same twelve documents indexed either way. The authority still holds no HTTP
+client — the first node to fetch a host reports what it got and everyone after
+is told — which keeps fetching where fetching already happens.
+
+Entries expire. A cache of `robots.txt` that never expires is a promise to obey
+yesterday's rules forever, and a site that adds a `Disallow` would have no way
+of being heard. A host that could not be reached is remembered as *unreachable*
+rather than as having no rules, because being unable to ask is not permission —
+for the next node either.
+
 ### A missing shard fails the query; a missing replica does not
 
 Results computed from four shards out of five are not slightly worse results;
@@ -543,8 +563,6 @@ Stated plainly, because a README that only lists what works is a sales page:
 - **Running the merger on a schedule, and replicating a new manifest** to a
   shard's other copies. `indexander merge` does the work; nothing yet decides
   when to call it or tells the replicas afterwards.
-- **A shared `robots.txt` cache.** The lease authority paces requests but does
-  not fetch `robots.txt`, so each node still makes that one request per host.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
 - **Block-max scoring.** Blocks are skipped when no document in them can

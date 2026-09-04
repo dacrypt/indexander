@@ -20,6 +20,7 @@ pub mod frontier;
 pub mod normalize;
 pub mod politeness;
 pub mod robots;
+pub mod robots_cache;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use crate::frontier::{Frontier, Limits};
 use crate::normalize::{host_of, resolve};
 use crate::politeness::{Politeness, wait_for};
 use crate::robots::Robots;
+use crate::robots_cache::{Known, RobotsCache};
 
 /// How the crawler behaves.
 #[derive(Debug, Clone)]
@@ -117,6 +119,28 @@ pub async fn crawl_with(
     sink: mpsc::Sender<Document>,
     politeness: Arc<Politeness>,
 ) -> Result<Stats, String> {
+    crawl_sharing(
+        config,
+        seeds,
+        sink,
+        politeness,
+        Arc::new(RobotsCache::default()),
+    )
+    .await
+}
+
+/// Crawls, deferring both politeness and `robots.txt` to somebody else.
+///
+/// The two are separate because they can be: a single node wants a local rate
+/// limiter and a local cache, a cluster wants both shared, and nothing stops a
+/// caller mixing them.
+pub async fn crawl_sharing(
+    config: &Config,
+    seeds: &[Url],
+    sink: mpsc::Sender<Document>,
+    politeness: Arc<Politeness>,
+    robots_cache: Arc<RobotsCache>,
+) -> Result<Stats, String> {
     let client = reqwest::Client::builder()
         .user_agent(config.user_agent.clone())
         .timeout(config.timeout)
@@ -142,7 +166,10 @@ pub async fn crawl_with(
         let config = config.clone();
         let sink = sink.clone();
         let politeness = Arc::clone(&politeness);
-        workers.spawn(async move { worker(&shared, &client, &config, &sink, &politeness).await });
+        let robots_cache = Arc::clone(&robots_cache);
+        workers.spawn(async move {
+            worker(&shared, &client, &config, &sink, &politeness, &robots_cache).await;
+        });
     }
     while workers.join_next().await.is_some() {}
 
@@ -176,6 +203,7 @@ async fn worker(
     config: &Config,
     sink: &mpsc::Sender<Document>,
     politeness: &Politeness,
+    robots_cache: &RobotsCache,
 ) {
     loop {
         let Some(pending) = shared.lock().await.frontier.next_url() else {
@@ -184,7 +212,15 @@ async fn worker(
         let host = host_of(&pending.url);
 
         // Ask this host's robots.txt once, before anything else.
-        let Some(rules) = ensure_robots(shared, client, config, &pending.url, politeness).await
+        let Some(rules) = ensure_robots(
+            shared,
+            client,
+            config,
+            &pending.url,
+            politeness,
+            robots_cache,
+        )
+        .await
         else {
             continue;
         };
@@ -271,28 +307,44 @@ async fn ensure_robots(
     config: &Config,
     url: &Url,
     politeness: &Politeness,
+    robots_cache: &RobotsCache,
 ) -> Option<Robots> {
     let host = host_of(url);
     if let Some(cached) = shared.lock().await.robots.get(&host) {
         return Some(cached.clone());
     }
 
-    let mut robots_url = url.clone();
-    robots_url.set_path("/robots.txt");
-    robots_url.set_query(None);
+    // Somebody else in the cluster may already have fetched it. On a single
+    // node the answer comes from this process's own memory, same shape.
+    let rules = match robots_cache.get(&host).await {
+        Known::Rules(text) => Robots::parse(&text, &config.user_agent),
+        Known::Unreachable => Robots::deny_all(),
+        Known::Unknown => {
+            let mut robots_url = url.clone();
+            robots_url.set_path("/robots.txt");
+            robots_url.set_query(None);
 
-    // robots.txt is itself a request to the host, so it waits its turn too.
-    wait_for(politeness.lease(&host, config.delay, 1).await).await;
+            // robots.txt is itself a request to the host, so it waits its turn.
+            wait_for(politeness.lease(&host, config.delay, 1).await).await;
 
-    let rules = match client.get(robots_url).send().await {
-        Ok(response) if response.status().is_success() => response.text().await.map_or_else(
-            |_| Robots::allow_all(),
-            |t| Robots::parse(&t, &config.user_agent),
-        ),
-        // No robots.txt, or it is gone: the site has no rules for us.
-        Ok(response) if response.status().is_client_error() => Robots::allow_all(),
-        // A server error or a failed connection is not consent.
-        _ => Robots::deny_all(),
+            let (learned, rules) = match client.get(robots_url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let text = response.text().await.unwrap_or_default();
+                    let rules = Robots::parse(&text, &config.user_agent);
+                    (Known::Rules(text), rules)
+                }
+                // No robots.txt, or it is gone: the site has no rules for us.
+                // Remembered as empty rules rather than as unknown, or every
+                // node would go on asking a host that has already said nothing.
+                Ok(response) if response.status().is_client_error() => {
+                    (Known::Rules(String::new()), Robots::allow_all())
+                }
+                // A server error or a failed connection is not consent.
+                _ => (Known::Unreachable, Robots::deny_all()),
+            };
+            robots_cache.learn(&host, learned).await;
+            rules
+        }
     };
 
     shared.lock().await.robots.insert(host, rules.clone());

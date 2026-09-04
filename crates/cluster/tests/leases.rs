@@ -214,3 +214,125 @@ async fn a_local_policy_and_a_remote_one_behave_the_same() {
         );
     }
 }
+
+// --- a shared robots.txt -------------------------------------------------
+
+use indexander_cluster::leases::remote_robots_cache;
+use indexander_crawl::robots_cache::Known;
+
+#[tokio::test]
+async fn a_hosts_robots_txt_is_fetched_once_for_the_whole_cluster() {
+    // The point: fifty nodes crawling one site should ask it about robots.txt
+    // once between them, not fifty times — and that first request is the one
+    // most likely to look like a swarm, because it is what every node does to
+    // a host it has never touched.
+    let address = authority(Duration::from_millis(1)).await;
+
+    let first = remote_robots_cache(&address).await.expect("connect");
+    let second = remote_robots_cache(&address).await.expect("connect");
+
+    // Nobody knows yet, so both would fetch.
+    assert_eq!(first.get("example.com").await, Known::Unknown);
+
+    // The first one fetches and shares.
+    first
+        .learn(
+            "example.com",
+            Known::Rules("User-agent: *\nDisallow: /private".into()),
+        )
+        .await;
+
+    // The second is told, and never asks the site.
+    let Known::Rules(text) = second.get("example.com").await else {
+        panic!("the second crawler was not told");
+    };
+    assert!(text.contains("Disallow: /private"));
+}
+
+#[tokio::test]
+async fn an_unreachable_host_stays_unreachable_for_everyone() {
+    // Being unable to ask is not permission, and it must not become
+    // permission for the next node either.
+    let address = authority(Duration::from_millis(1)).await;
+    let a = remote_robots_cache(&address).await.expect("connect");
+    let b = remote_robots_cache(&address).await.expect("connect");
+
+    a.learn("down.example", Known::Unreachable).await;
+    assert_eq!(b.get("down.example").await, Known::Unreachable);
+}
+
+#[tokio::test]
+async fn a_host_with_no_robots_txt_is_remembered_as_having_none() {
+    // Remembered as empty rules rather than as unknown, or every node would
+    // go on asking a host that has already said nothing.
+    let address = authority(Duration::from_millis(1)).await;
+    let a = remote_robots_cache(&address).await.expect("connect");
+    let b = remote_robots_cache(&address).await.expect("connect");
+
+    a.learn("bare.example", Known::Rules(String::new())).await;
+    assert_eq!(b.get("bare.example").await, Known::Rules(String::new()));
+}
+
+/// Killing the acceptor does not kill the connections it already made.
+///
+/// Written expecting the opposite, and the test was wrong rather than the
+/// code: each accepted connection is served by its own task, so aborting the
+/// one that calls `accept` stops new crawlers joining and leaves the ones
+/// already talking unaffected. Worth asserting, because it is what a rolling
+/// restart of an authority actually looks like.
+///
+/// The fallback when an authority is genuinely gone — answer "nobody knows",
+/// so a crawler fetches for itself rather than stopping — is asserted in
+/// `indexander_crawl::robots_cache`, where a dead channel can be produced on
+/// purpose instead of hoped for.
+#[tokio::test]
+async fn an_authority_that_stops_accepting_keeps_serving_its_connections() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    let authority = Arc::new(LeaseAuthority::new(Duration::from_millis(1)));
+    let acceptor = tokio::spawn(async move {
+        let _ = authority.serve(listener).await;
+    });
+
+    let cache = remote_robots_cache(&address).await.expect("connect");
+    cache
+        .learn("example.com", Known::Rules("Disallow: /x".into()))
+        .await;
+
+    acceptor.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The existing connection still works.
+    assert_eq!(
+        cache.get("example.com").await,
+        Known::Rules("Disallow: /x".into())
+    );
+    // But nobody new can join.
+    assert!(remote_robots_cache(&address).await.is_err());
+}
+
+#[tokio::test]
+async fn a_remembered_robots_txt_expires() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    let authority = Arc::new(LeaseAuthority::with_robots_ttl(
+        Duration::from_millis(1),
+        Duration::from_millis(30),
+    ));
+    tokio::spawn(async move {
+        let _ = authority.serve(listener).await;
+    });
+
+    let cache = remote_robots_cache(&address).await.expect("connect");
+    cache
+        .learn("example.com", Known::Rules("Disallow: /x".into()))
+        .await;
+    assert_ne!(cache.get("example.com").await, Known::Unknown);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        cache.get("example.com").await,
+        Known::Unknown,
+        "a site that changes its robots.txt would never be heard"
+    );
+}

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use indexander_core::Result;
 use indexander_crawl::politeness::{LeaseRequest, LocalPolicy, Politeness};
+use indexander_crawl::robots_cache::{Known, LocalRobotsCache, RobotsCache, RobotsRequest};
 use indexander_proto::message::{PROTOCOL_VERSION, Request, Response};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -33,10 +34,20 @@ fn millis_rounding_up(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
 }
 
-/// Serves lease requests for whichever hosts are routed here.
+/// Serves lease requests, and remembers each host's `robots.txt`.
+///
+/// The two belong together: whoever owns a host's rate limit is the natural
+/// place to remember what that host said about being crawled, and it means one
+/// address per host rather than two.
+///
+/// The authority still holds no HTTP client. The first crawler to fetch a
+/// host's `robots.txt` reports what it got, and everyone after is told — which
+/// keeps fetching where fetching already happens and keeps this a pure
+/// bookkeeping service.
 #[derive(Debug)]
 pub struct LeaseAuthority {
     policy: LocalPolicy,
+    robots: LocalRobotsCache,
 }
 
 impl LeaseAuthority {
@@ -44,8 +55,17 @@ impl LeaseAuthority {
     /// crawler asks for.
     #[must_use]
     pub fn new(floor: Duration) -> Self {
+        Self::with_robots_ttl(floor, Duration::from_secs(24 * 60 * 60))
+    }
+
+    /// As [`LeaseAuthority::new`], choosing how long a `robots.txt` is
+    /// remembered. A cache that never expires is a promise to obey yesterday's
+    /// rules forever.
+    #[must_use]
+    pub fn with_robots_ttl(floor: Duration, robots_ttl: Duration) -> Self {
         Self {
             policy: LocalPolicy::new(floor),
+            robots: LocalRobotsCache::new(robots_ttl),
         }
     }
 
@@ -69,6 +89,19 @@ impl LeaseAuthority {
                     permits: lease.permits,
                     spacing_ms: millis_rounding_up(lease.spacing),
                 }
+            }
+            Request::Robots {
+                host,
+                learned,
+                state,
+                text,
+            } => {
+                if *learned {
+                    self.robots.learn(host, decode_known(*state, text)).await;
+                }
+                let known = self.robots.get(host).await;
+                let (state, text) = encode_known(&known);
+                Response::Robots { state, text }
             }
             other => Response::Error {
                 message: format!("a lease authority cannot answer {other:?}"),
@@ -102,6 +135,74 @@ impl LeaseAuthority {
             };
             write_frame(&mut stream, &response.encode()).await?;
         }
+    }
+}
+
+/// The wire encoding of what is known about a host.
+fn encode_known(known: &Known) -> (u8, String) {
+    match known {
+        Known::Unknown => (0, String::new()),
+        Known::Rules(text) => (1, text.clone()),
+        Known::Unreachable => (2, String::new()),
+    }
+}
+
+fn decode_known(state: u8, text: &str) -> Known {
+    match state {
+        1 => Known::Rules(text.to_owned()),
+        2 => Known::Unreachable,
+        // Anything else is treated as "nobody knows", which makes the asker
+        // fetch for itself. A state this build does not understand must not
+        // become permission.
+        _ => Known::Unknown,
+    }
+}
+
+/// Connects to a lease authority and returns a [`RobotsCache`] that defers to
+/// it.
+///
+/// A separate connection from the one [`remote_politeness`] opens, so a slow
+/// `robots.txt` exchange never sits in front of a lease.
+pub async fn remote_robots_cache(address: &str) -> Result<RobotsCache> {
+    let mut stream = TcpStream::connect(address).await?;
+    let _ = stream.set_nodelay(true);
+    read_hello(&mut stream, PROTOCOL_VERSION).await?;
+    write_hello(&mut stream, PROTOCOL_VERSION).await?;
+
+    let (tx, mut rx) = mpsc::channel::<RobotsRequest>(64);
+    tokio::spawn(async move {
+        while let Some(request) = rx.recv().await {
+            let (state, text) = request
+                .learned
+                .as_ref()
+                .map_or((0, String::new()), encode_known);
+            let wire = Request::Robots {
+                host: request.host,
+                learned: request.learned.is_some(),
+                state,
+                text,
+            };
+            // If the authority is gone, dropping the reply leaves the crawler
+            // with "nobody knows", so it fetches for itself rather than
+            // stopping.
+            let Ok(answer) = ask_robots(&mut stream, &wire).await else {
+                return;
+            };
+            let _ = request.reply.send(answer);
+        }
+    });
+
+    Ok(RobotsCache::Delegated(tx))
+}
+
+async fn ask_robots(stream: &mut TcpStream, request: &Request) -> Result<Known> {
+    write_frame(stream, &request.encode()).await?;
+    let payload = read_frame(stream).await?;
+    match Response::decode(&payload)? {
+        Response::Robots { state, text } => Ok(decode_known(state, &text)),
+        other => Err(indexander_core::Error::Corrupt(format!(
+            "lease authority answered {other:?} to a robots request"
+        ))),
     }
 }
 

@@ -80,8 +80,8 @@ pub fn handle(segment: &Segment, request: &Request) -> Response {
         // Answering anyway would be worse than refusing — a crawler would
         // believe it had permission nobody coordinated, and a ranking run
         // would believe it had a partition of the graph that is not here.
-        Request::Lease { .. } => Response::Error {
-            message: "a shard does not grant fetch leases".to_owned(),
+        Request::Lease { .. } | Request::Robots { .. } => Response::Error {
+            message: "a shard does not grant fetch leases or hold robots.txt".to_owned(),
         },
         // Handled above.
         Request::SegmentInfo | Request::SegmentChunk { .. } => Response::Error {
