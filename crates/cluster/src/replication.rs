@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use indexander_core::{Error, Result};
-use indexander_index::segment::{Segment, digest_of};
+use indexander_index::segment::Segment;
 use indexander_proto::message::{PROTOCOL_VERSION, Request, Response};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -93,9 +93,18 @@ pub async fn fetch_segment(address: &str, destination: &Path) -> Result<SegmentI
         )));
     }
 
-    // Read back what was actually written, not what was believed to be sent.
+    // Read back what was actually written, not what was believed to be sent,
+    // and let the segment check itself.
+    //
+    // An earlier version recomputed the digest here over "everything but the
+    // footer", with the footer's length written out as a constant. The footer
+    // then grew by three fields and this went on subtracting the old number:
+    // every transfer failed, which was the lucky direction. Knowing the format
+    // in two places is the bug; `Segment::verify` knows it in one.
     let written = tokio::fs::read(&temporary).await?;
-    if digest_of(&written[..written.len().saturating_sub(footer_len())]) != digest {
+    let intact = Segment::from_bytes(written)
+        .is_ok_and(|segment| segment.verify() && segment.digest() == digest);
+    if !intact {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(Error::Corrupt(format!(
             "the copy from {address} does not match its digest"
@@ -104,13 +113,6 @@ pub async fn fetch_segment(address: &str, destination: &Path) -> Result<SegmentI
 
     tokio::fs::rename(&temporary, destination).await?;
     Ok(SegmentInfo { digest, len })
-}
-
-/// The footer is not part of what the digest covers, so it has to be excluded
-/// when checking a copy. Derived from a segment rather than hardcoded here.
-fn footer_len() -> usize {
-    // Six u64 offsets, the u64 digest, a u32 version and a 4-byte magic.
-    6 * 8 + 8 + 4 + 4
 }
 
 async fn call(stream: &mut TcpStream, request: &Request) -> Result<Response> {

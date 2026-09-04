@@ -37,7 +37,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Tests | 264, including full crawls and eight-shard queries over real sockets |
-| Memory | 32 MB resident to serve a 236 MB index |
+| Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
 
@@ -336,10 +336,20 @@ original design, still here.
 are touched, and a query touches a term dictionary entry and one postings list,
 not the whole index.
 
-The 32 MB that remain are the document store: every document's URI, field
-lengths and rank, parsed up front because scoring needs them for whatever
-document a query lands on. Keeping that on disk too is the next thing to do
-here.
+The document store used to be the 32 MB that stayed resident, and splitting it
+by *how it is used* rather than by what it is took that to 7.7 MB:
+
+- **A document's length and rank are read once per candidate**, so they are a
+  fixed eight bytes per document, read in at open — under a megabyte for a
+  hundred thousand of them. Leaving these on the mapping was tried and cost
+  about a fifth of the query time for no memory worth having.
+- **A document's URI is read only for the results**, ten of them, so it stays
+  on the mapping behind an offset table and is borrowed rather than copied.
+  These were the nine megabytes, and parsing them all into allocated strings
+  at open to show ten was the actual waste.
+
+Along the way: the length had been stored per field, three numbers that nothing
+had ever read except to add together. One number now.
 
 This is the one `unsafe` block in the engine, and it comes with an obligation.
 `Mmap::map` is unsafe because the mapping reflects the file: if anyone rewrites

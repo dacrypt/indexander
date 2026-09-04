@@ -40,15 +40,17 @@ use indexander_core::{DocId, Error, Field, Position, Result};
 use crate::codec::{read_deltas, read_varint};
 
 pub(crate) const MAGIC: &[u8; 4] = b"IXDR";
-pub(crate) const VERSION: u32 = 6;
+pub(crate) const VERSION: u32 = 7;
 /// Postings per skip block.
 ///
 /// Small enough that decoding one block to find a document is cheap; large
 /// enough that the skip index stays a small fraction of the postings. 128 is
 /// the number every implementation of this lands on, for the same reasons.
 pub(crate) const SKIP_INTERVAL: usize = 128;
-/// Six u64 offsets, a u64 digest, a u32 version, a 4-byte magic.
-pub(crate) const FOOTER_LEN: usize = 6 * 8 + 8 + 4 + 4;
+/// Nine u64 fields, a u64 digest, a u32 version, a 4-byte magic.
+pub(crate) const FOOTER_LEN: usize = 9 * 8 + 8 + 4 + 4;
+/// Bytes per document in the lengths block: a `u32` length and an `f32` rank.
+const DOC_RECORD: usize = 8;
 
 /// One term's appearance in one field of one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,8 +115,8 @@ impl Posting {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocMeta {
     pub uri: String,
-    /// Token count per field, indexed by `Field as usize`.
-    pub lengths: [u32; 3],
+    /// Tokens in the document.
+    pub length: u32,
     /// PageRank of this document, or 0 if the index was built without a graph.
     pub rank: f32,
 }
@@ -122,7 +124,7 @@ pub struct DocMeta {
 impl DocMeta {
     #[must_use]
     pub fn total_length(&self) -> u32 {
-        self.lengths.iter().sum()
+        self.length
     }
 }
 
@@ -155,11 +157,23 @@ pub struct Segment {
     bytes: Backing,
     digest: u64,
     postings_offset: usize,
+    uri_offsets_offset: usize,
+    uri_bytes_offset: usize,
     term_dict_offset: usize,
     term_offsets_offset: usize,
     num_terms: usize,
-    docs: Vec<DocMeta>,
+    num_docs: usize,
     average_length: f32,
+    /// Length and rank per document, read in at open.
+    ///
+    /// Deliberately *not* left on the mapping, unlike everything else here.
+    /// The scorer touches this once per candidate, and going through the
+    /// mapping for it cost about a fifth of the query time — while the block
+    /// itself is eight bytes a document, under a megabyte for a hundred
+    /// thousand of them. The uris are the part that was worth making lazy:
+    /// nine megabytes, and only the ten that appear in the results are ever
+    /// read.
+    docs: Vec<(u32, f32)>,
 }
 
 impl Segment {
@@ -227,81 +241,71 @@ impl Segment {
         let read_u64 = |i: usize| -> usize {
             u64::from_le_bytes(footer[i * 8..i * 8 + 8].try_into().expect("8 bytes")) as usize
         };
-        let digest = u64::from_le_bytes(footer[6 * 8..7 * 8].try_into().expect("8 bytes"));
+        let digest = u64::from_le_bytes(footer[9 * 8..10 * 8].try_into().expect("8 bytes"));
+
         let postings_offset = read_u64(0);
-        let doc_store_offset = read_u64(1);
-        let term_dict_offset = read_u64(2);
-        let term_offsets_offset = read_u64(3);
-        let num_terms = read_u64(4);
-        let num_docs = read_u64(5);
+        let doc_lengths_offset = read_u64(1);
+        let uri_offsets_offset = read_u64(2);
+        let uri_bytes_offset = read_u64(3);
+        let term_dict_offset = read_u64(4);
+        let term_offsets_offset = read_u64(5);
+        let num_terms = read_u64(6);
+        let num_docs = read_u64(7);
+        let total_length = read_u64(8);
 
         let body = bytes.len() - FOOTER_LEN;
         if term_offsets_offset > body
             || term_dict_offset > term_offsets_offset
-            || doc_store_offset > term_dict_offset
-            || postings_offset > doc_store_offset
+            || uri_bytes_offset > term_dict_offset
+            || uri_offsets_offset > uri_bytes_offset
+            || doc_lengths_offset > uri_offsets_offset
+            || postings_offset > doc_lengths_offset
         {
             return Err(Error::Corrupt("footer offsets out of order".into()));
         }
         if term_offsets_offset + num_terms * 4 > body {
             return Err(Error::Corrupt("term offset table runs past end".into()));
         }
+        // Both document blocks are fixed width, so their size is known and can
+        // be checked once here instead of on every access.
+        if doc_lengths_offset + num_docs * DOC_RECORD > body
+            || uri_offsets_offset + (num_docs + 1) * 8 > body
+        {
+            return Err(Error::Corrupt("document store runs past end".into()));
+        }
 
-        let docs = Self::read_doc_store(&bytes, doc_store_offset, num_docs)?;
-        let average_length = if docs.is_empty() {
+        #[allow(clippy::cast_precision_loss)]
+        let average_length = if num_docs == 0 {
             0.0
         } else {
-            docs.iter().map(|d| d.total_length() as f32).sum::<f32>() / docs.len() as f32
+            total_length as f32 / num_docs as f32
         };
+
+        let mut docs = Vec::with_capacity(num_docs);
+        for i in 0..num_docs {
+            let at = doc_lengths_offset + i * DOC_RECORD;
+            let record = bytes
+                .get(at..at + DOC_RECORD)
+                .ok_or_else(|| Error::Corrupt("document store is short".into()))?;
+            docs.push((
+                u32::from_le_bytes(record[0..4].try_into().expect("4 bytes")),
+                f32::from_le_bytes(record[4..8].try_into().expect("4 bytes")),
+            ));
+        }
 
         Ok(Self {
             bytes,
             digest,
             postings_offset,
+            uri_offsets_offset,
+            uri_bytes_offset,
             term_dict_offset,
             term_offsets_offset,
             num_terms,
-            docs,
+            num_docs,
             average_length,
+            docs,
         })
-    }
-
-    fn read_doc_store(bytes: &[u8], offset: usize, expected: usize) -> Result<Vec<DocMeta>> {
-        let mut cursor = offset;
-        let count = read_varint(bytes, &mut cursor)? as usize;
-        if count != expected {
-            return Err(Error::Corrupt(
-                "document count disagrees with footer".into(),
-            ));
-        }
-        let mut docs = Vec::with_capacity(count);
-        for _ in 0..count {
-            let uri_len = read_varint(bytes, &mut cursor)? as usize;
-            let end = cursor
-                .checked_add(uri_len)
-                .filter(|e| *e <= bytes.len())
-                .ok_or_else(|| Error::Corrupt("uri runs past end".into()))?;
-            let uri = String::from_utf8(bytes[cursor..end].to_vec())
-                .map_err(|_| Error::Corrupt("uri is not utf-8".into()))?;
-            cursor = end;
-            let mut lengths = [0u32; 3];
-            for slot in &mut lengths {
-                *slot = u32::try_from(read_varint(bytes, &mut cursor)?)
-                    .map_err(|_| Error::Corrupt("field length exceeds u32".into()))?;
-            }
-            let rank_at = cursor;
-            let rank_bytes: [u8; 4] = bytes
-                .get(rank_at..rank_at + 4)
-                .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| Error::Corrupt("document store ends mid-rank".into()))?;
-            cursor += 4;
-            docs.push(DocMeta {
-                uri,
-                lengths,
-                rank: f32::from_le_bytes(rank_bytes),
-            });
-        }
-        Ok(docs)
     }
 
     /// The segment's raw bytes, exactly as they are on disk.
@@ -327,10 +331,10 @@ impl Segment {
 
     /// Recomputes the digest over the actual bytes and compares.
     ///
-    /// Not done on open: a 248 MB segment is memory mapped precisely so that
-    /// a query touches a few pages, and hashing it would touch all of them.
-    /// This is for after a transfer, when the question is whether what
-    /// arrived is what was sent.
+    /// Not done on open: a segment is memory mapped precisely so that a query
+    /// touches a few pages, and hashing it would touch all of them. This is
+    /// for after a transfer, when the question is whether what arrived is what
+    /// was sent.
     ///
     /// It detects corruption, not tampering. Anyone who can rewrite a segment
     /// can rewrite its footer, and defending against that is a different
@@ -343,7 +347,7 @@ impl Segment {
 
     #[must_use]
     pub fn document_count(&self) -> usize {
-        self.docs.len()
+        self.num_docs
     }
 
     #[must_use]
@@ -361,14 +365,64 @@ impl Segment {
     /// A corpus-wide average cannot be assembled from per-segment averages
     /// without also knowing how many documents each was over, so this is the
     /// number that travels.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     #[must_use]
     pub fn total_length(&self) -> u64 {
-        self.docs.iter().map(|d| u64::from(d.total_length())).sum()
+        (self.average_length * self.num_docs as f32) as u64
     }
 
+    /// A document's per-field token counts and rank.
+    ///
+    /// Read straight out of the mapped file: sixteen bytes at a known offset,
+    /// no parsing and no allocation. This is on the path of every candidate a
+    /// query scores, which is why the block is fixed width.
     #[must_use]
-    pub fn doc(&self, id: DocId) -> Option<&DocMeta> {
-        self.docs.get(id.as_usize())
+    pub fn doc_lengths(&self, id: DocId) -> Option<(u32, f32)> {
+        self.docs.get(id.as_usize()).copied()
+    }
+
+    /// Total tokens in a document, which is what length normalisation wants.
+    #[must_use]
+    pub fn doc_total_length(&self, id: DocId) -> u32 {
+        self.doc_lengths(id).map_or(0, |(length, _)| length)
+    }
+
+    /// A document's rank, or zero if it has none.
+    #[must_use]
+    pub fn doc_rank(&self, id: DocId) -> f32 {
+        self.doc_lengths(id).map_or(0.0, |(_, rank)| rank)
+    }
+
+    /// A document's uri, borrowed from the mapped file.
+    ///
+    /// Only the results of a query need this — ten strings, not a hundred
+    /// thousand — so it is read on demand rather than parsed at open.
+    #[must_use]
+    pub fn doc_uri(&self, id: DocId) -> Option<&str> {
+        if id.as_usize() >= self.num_docs {
+            return None;
+        }
+        let table = self.uri_offsets_offset + id.as_usize() * 8;
+        let read = |at: usize| -> Option<usize> {
+            Some(u64::from_le_bytes(self.bytes.get(at..at + 8)?.try_into().ok()?) as usize)
+        };
+        let start = self.uri_bytes_offset + read(table)?;
+        let end = self.uri_bytes_offset + read(table + 8)?;
+        std::str::from_utf8(self.bytes.get(start..end)?).ok()
+    }
+
+    /// Everything stored about a document, assembled on demand.
+    ///
+    /// Allocates the uri, so it is for callers who want a whole record — a
+    /// merge, a test — not for the scoring path.
+    #[must_use]
+    pub fn doc(&self, id: DocId) -> Option<DocMeta> {
+        let (length, rank) = self.doc_lengths(id)?;
+        Some(DocMeta {
+            uri: self.doc_uri(id)?.to_owned(),
+            length,
+            rank,
+        })
     }
 
     /// Reads the dictionary entry at index `i`: term bytes, postings offset,

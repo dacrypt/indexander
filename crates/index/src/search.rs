@@ -220,10 +220,13 @@ pub fn search_with_stats(
         .collect();
 
     for &doc in &candidates {
-        let Some(meta) = segment.doc(doc) else {
+        // Sixteen bytes from the mapped file, not a document record with an
+        // allocated uri: this runs once per candidate, and the uri is needed
+        // only for the handful that end up in the results.
+        let Some((length, rank)) = segment.doc_lengths(doc) else {
             continue;
         };
-        let length_norm = length_norm(meta.total_length(), average_length);
+        let length_norm = length_norm(length, average_length);
         let mut score = 0.0f32;
 
         for (term_idf, list, cursor) in &mut scorers {
@@ -239,7 +242,7 @@ pub fn search_with_stats(
 
         // Authority scales relevance; it never creates it. A document that
         // scored zero on the query still scores zero.
-        score *= authority(meta.rank, total_docs);
+        score *= authority(rank, total_docs);
 
         heap.push(Ranked(score, doc));
         if heap.len() > limit {
@@ -360,8 +363,8 @@ fn leapfrog(
         }
 
         if !dropped {
-            if let Some(meta) = segment.doc(pivot) {
-                let length_norm = length_norm(meta.total_length(), average_length);
+            if let Some((length, rank)) = segment.doc_lengths(pivot) {
+                let length_norm = length_norm(length, average_length);
                 // Summed in the cursors' order, which is by document frequency
                 // and then by term - deterministic, so scores are reproducible.
                 let mut score = 0.0f32;
@@ -369,7 +372,7 @@ fn leapfrog(
                     let tf = cursor.weighted_frequency();
                     score += term_idf * saturation(tf, length_norm);
                 }
-                score *= authority(meta.rank, total_docs);
+                score *= authority(rank, total_docs);
                 heap.push(Ranked(score, pivot));
                 if heap.len() > limit {
                     heap.pop();
@@ -395,7 +398,7 @@ fn finish(heap: BinaryHeap<Ranked>, segment: &Segment, limit: usize) -> Vec<Hit>
         .into_iter()
         .map(|Ranked(score, doc)| Hit {
             doc,
-            uri: segment.doc(doc).map(|d| d.uri.clone()).unwrap_or_default(),
+            uri: segment.doc_uri(doc).unwrap_or_default().to_owned(),
             score,
         })
         .collect();

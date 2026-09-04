@@ -41,8 +41,14 @@ struct DocOccurrences {
 #[derive(Debug, Clone)]
 struct StoredDoc {
     uri: String,
-    /// Token counts per field, for length normalisation.
-    lengths: [u32; 3],
+    /// Tokens in the document, for length normalisation.
+    ///
+    /// The total, not a count per field. Fields are weighted through the
+    /// postings, where a term's frequency is already recorded per field;
+    /// nothing has ever read a per-field *document* length except to add the
+    /// three of them together, and storing three numbers to only ever sum
+    /// them cost eight bytes per document and an addition per candidate.
+    length: u32,
     /// PageRank, or `1/n` when no link graph was computed. Stored rather than
     /// recomputed because ranking a query must not depend on the whole graph
     /// being in memory.
@@ -69,7 +75,7 @@ fn posting_bound(
         .enumerate()
         .map(|(i, f)| Field::ALL[i].weight() * f.positions.len() as f32)
         .sum();
-    let norm = length_norm(meta.lengths.iter().sum(), average_length);
+    let norm = length_norm(meta.length, average_length);
     saturation(weighted, norm) * authority(meta.rank, doc_count)
 }
 
@@ -144,7 +150,7 @@ impl SegmentBuilder {
 
         self.docs.push(StoredDoc {
             uri: doc.uri.clone(),
-            lengths,
+            length: lengths.iter().sum(),
             rank: 0.0,
         });
         id
@@ -190,7 +196,7 @@ impl SegmentBuilder {
                     .ok_or_else(|| Error::Corrupt("document store is short".into()))?;
                 builder.docs.push(StoredDoc {
                     uri: meta.uri.clone(),
-                    lengths: meta.lengths,
+                    length: meta.length,
                     rank: meta.rank,
                 });
             }
@@ -261,11 +267,7 @@ impl SegmentBuilder {
         let average_length = if doc_count == 0 {
             0.0
         } else {
-            self.docs
-                .iter()
-                .map(|d| d.lengths.iter().sum::<u32>() as f32)
-                .sum::<f32>()
-                / doc_count as f32
+            self.docs.iter().map(|d| d.length as f32).sum::<f32>() / doc_count as f32
         };
 
         // --- postings block -------------------------------------------------
@@ -350,19 +352,44 @@ impl SegmentBuilder {
             term_meta.push((offset, docs.len() as u64));
         }
 
-        // --- document store -------------------------------------------------
-        let doc_store_offset = out.len() as u64;
-        write_varint(self.docs.len() as u64, &mut out);
+        // --- document store, in two parts -----------------------------------
+        //
+        // Split by how it is used, not by what it is.
+        //
+        // Lengths and rank are needed for *every candidate* a query touches,
+        // so they are a fixed sixteen bytes per document: no varints, no
+        // parsing, indexable straight from the mapped file by document id.
+        // Only the pages a query actually reaches become resident.
+        //
+        // The uri is needed only for the handful of documents that end up in
+        // the results, so it lives apart, behind an offset table, and is read
+        // on demand. Keeping the two together meant parsing every uri into an
+        // allocated `String` at open — nine megabytes to answer a query that
+        // will show ten of them.
+        let doc_lengths_offset = out.len() as u64;
+        let mut total_length = 0u64;
         for doc in &self.docs {
-            write_varint(doc.uri.len() as u64, &mut out);
-            out.extend_from_slice(doc.uri.as_bytes());
-            for length in doc.lengths {
-                write_varint(u64::from(length), &mut out);
-            }
+            out.extend_from_slice(&doc.length.to_le_bytes());
+            total_length += u64::from(doc.length);
             // Raw f32 bits: ranks are tiny fractions, and a varint of a scaled
             // integer would lose precision exactly where it matters, among the
             // many pages whose ranks differ in the sixth decimal.
             out.extend_from_slice(&doc.rank.to_le_bytes());
+        }
+
+        // Offsets first, then the bytes: `n + 1` entries so every uri's end is
+        // the next one's start and the last has a sentinel.
+        let uri_offsets_offset = out.len() as u64;
+        let mut at = 0u64;
+        for doc in &self.docs {
+            out.extend_from_slice(&at.to_le_bytes());
+            at += doc.uri.len() as u64;
+        }
+        out.extend_from_slice(&at.to_le_bytes());
+
+        let uri_bytes_offset = out.len() as u64;
+        for doc in &self.docs {
+            out.extend_from_slice(doc.uri.as_bytes());
         }
 
         // --- term dictionary ------------------------------------------------
@@ -395,11 +422,17 @@ impl SegmentBuilder {
         let footer_start = out.len();
         for value in [
             postings_offset,
-            doc_store_offset,
+            doc_lengths_offset,
+            uri_offsets_offset,
+            uri_bytes_offset,
             term_dict_offset,
             term_offsets_offset,
             self.terms.len() as u64,
             self.docs.len() as u64,
+            // Stored rather than summed at open: the average document length
+            // is needed by every query and computing it would touch every
+            // page of the block that was just made lazy.
+            total_length,
         ] {
             out.extend_from_slice(&value.to_le_bytes());
         }
