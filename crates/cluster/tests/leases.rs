@@ -311,13 +311,26 @@ async fn an_authority_that_stops_accepting_keeps_serving_its_connections() {
     assert!(remote_robots_cache(&address).await.is_err());
 }
 
+/// The authority's expiry is configurable, and the wire carries whatever it
+/// decides.
+///
+/// Whether an entry actually expires on time is a property of
+/// `LocalRobotsCache` and is asserted there, with tokio's clock paused so the
+/// answer is exact. An earlier version of this test used a thirty-millisecond
+/// expiry and a real sleep, and failed on a loaded CI runner because the entry
+/// expired before the assertion that it had not. Testing a duration by waiting
+/// for it measures the machine.
 #[tokio::test]
-async fn a_remembered_robots_txt_expires() {
+async fn the_authority_serves_whatever_its_cache_says() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("addr").to_string();
+    // An expiry of zero: every entry is already stale, so the authority always
+    // answers "nobody knows" and every crawler fetches for itself. Extreme,
+    // and it proves the wire reports what the cache decides rather than
+    // remembering on its own.
     let authority = Arc::new(LeaseAuthority::with_robots_ttl(
         Duration::from_millis(1),
-        Duration::from_millis(30),
+        Duration::ZERO,
     ));
     tokio::spawn(async move {
         let _ = authority.serve(listener).await;
@@ -327,12 +340,5 @@ async fn a_remembered_robots_txt_expires() {
     cache
         .learn("example.com", Known::Rules("Disallow: /x".into()))
         .await;
-    assert_ne!(cache.get("example.com").await, Known::Unknown);
-
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert_eq!(
-        cache.get("example.com").await,
-        Known::Unknown,
-        "a site that changes its robots.txt would never be heard"
-    );
+    assert_eq!(cache.get("example.com").await, Known::Unknown);
 }

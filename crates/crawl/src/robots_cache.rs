@@ -17,9 +17,14 @@
 //! have no way of being heard.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
+// Tokio's clock rather than the standard library's. They behave identically in
+// a running program, and under `tokio::time::pause` this one can be advanced
+// on demand — which is the difference between testing an expiry deterministically
+// and sleeping for a while and hoping the machine was not busy.
+use tokio::time::Instant;
 
 /// What is known about a host's `robots.txt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
