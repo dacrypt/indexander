@@ -36,10 +36,10 @@ language and the ranking are real and tested end to end.
 |---|---|
 | Indexing | 702 MiB of text into a 222 MiB index in 9.5–15.2 s on 14 threads, from 52.9–61.4 s on one |
 | Index size | 35% of the text it indexes |
-| Query latency | 16 µs to 144 µs over 7,661 documents, warm; the older 103k-document figures elsewhere in this file were measured under the intersection semantics that bare terms no longer have |
+| Query latency | 18 µs to 63 µs over 7,661 documents, warm; the older 103k-document figures elsewhere in this file were measured under the intersection semantics that bare terms no longer have |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.258 MAP and 0.844 success@10 on Cranfield's human judgements; 0.557 MRR on known-item queries |
-| Tests | 379, including full crawls and eight-shard queries over real sockets |
+| Tests | 381, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -660,6 +660,53 @@ where the document says `BÚSQUEDA`. The one thing shared with the index is the
 tokenizer — a single scanner, so what is highlighted is exactly what matched
 rather than nearly.
 
+### Skipping what cannot win
+
+Bare terms are optional, so a query is a union, and a union cannot pass over a
+document just because one term is missing from it. Walked naively that is
+expensive in exactly one place — the commonest word in the corpus, which is in
+a third of the documents, wins none of them, and costs more than the rest of
+the query put together.
+
+So the walk is [MaxScore](https://doi.org/10.1016/0306-4573(95)00020-H). Every
+term has a ceiling: the largest contribution any document could take from it,
+which is the maximum block bound the indexer already wrote times the query's
+`idf`. Against the current k-th best score, terms split into the *essential*
+ones — whose ceilings still add up to something that could beat it — and the
+rest, which are looked up by seek on the documents the essential ones propose,
+rather than walked. As the heap fills the threshold rises and more terms drop
+out of the walk; when all of them have, the query stops.
+
+That does nothing for a query of one term, because that term is always
+essential. What helps there is the block: if the best any document in the
+current block could score, plus the most every other term could ever add, still
+cannot beat the threshold, then none of those 128 documents can and the block
+goes unread.
+
+| query | intersection, before | union, walked in full | union, as it is now |
+|---|---|---|---|
+| `the` | 63 µs | 144 µs | **63 µs** |
+| `index` | 43 µs | 43 µs | 39 µs |
+| `inverted index` | 36 µs | 41 µs | 34 µs |
+| `kubernetes` | 16 µs | 17 µs | 18 µs |
+
+Scoring every document that contains any query term now costs what requiring
+all of them used to.
+
+MaxScore rather than WAND because the arithmetic is a suffix sum instead of a
+pivot search, and this has to be *exactly* as correct as the exhaustive walk.
+`maxscore_returns_exactly_what_the_exhaustive_union_returns` keeps a full,
+unpruned union in the test module and compares the two hit for hit and score
+bit for bit, over nine queries at five limits. An optimisation that returns
+nearly the right answers is a bug in the shape of results nobody notices are
+missing.
+
+That comparison is also what found a bug older than the optimisation, described
+under what is not built yet: the stored bounds are not upper bounds when a
+query scores with corpus-wide statistics, which is every sharded query and
+every index of more than one segment. Those now walk everything rather than
+prune on a number that does not hold.
+
 ## Query syntax
 
 ```text
@@ -715,13 +762,17 @@ Stated plainly, because a README that only lists what works is a sales page:
   just merged.
 - **Sweeping orphans.** They are listed, never deleted. Deciding a file is
   unreferenced is easy; deciding nobody is still reading it is not.
-- **Recovering what the union cost.** Bare terms became optional, and a union
-  cannot skip a document just because one term is missing from it — so the
-  block-max bounds stored with every postings list, which used to let a common
-  term skip whole blocks, are no longer consulted while scoring. Measured, that
-  is 2.3x on the commonest term in the corpus (63 µs to 144 µs) and nothing
-  measurable on anything else. WAND would get it back, using the bounds that
-  are already there.
+- **Letting a shard prune.** The block bounds are computed when a segment is
+  written, with that segment's own average document length and document count.
+  A query scoring with corpus-wide statistics uses neither, and a shard whose
+  documents are shorter than the corpus average then gets contributions *above*
+  the bounds recorded for them — measured at 6% to 16% over, on a segment
+  averaging 25 tokens against a corpus averaging 400. Pruning on a bound that
+  does not bound drops results silently, so a query with corpus-wide statistics
+  walks everything. That costs a shard about 1.8x on the commonest term
+  (63 µs against 113 µs). The fix is to store what the bound is made of — the
+  block's largest weighted frequency, shortest document and highest rank —
+  and compute it at query time. A segment format change.
 - **A judged collection in the repository.** The engine is measured against
   Cranfield, which is fetched and converted by
   [docs/cranfield.py](docs/cranfield.py) rather than committed. A larger,

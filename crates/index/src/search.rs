@@ -17,7 +17,7 @@ use indexander_core::{DocId, Field, Result};
 
 use crate::query::Query;
 use crate::scoring::idf;
-use crate::segment::{Posting, Segment};
+use crate::segment::{Posting, PostingsCursor, Segment};
 
 /// Corpus-wide term statistics, supplied from outside.
 ///
@@ -256,23 +256,35 @@ pub fn search_with_stats(
     Ok(finish(heap, segment, limit))
 }
 
-/// Answers a phrase-free query by walking the union of its terms' postings.
+/// Answers a phrase-free query by walking the union of its terms' postings,
+/// skipping the parts of it that cannot reach the top `limit`.
 ///
 /// Bare terms are optional, so a document qualifies by containing *any* of
 /// them and is ranked by how much of the query it accounts for — which BM25
-/// does on its own, by summing one contribution per term present. Nothing has
-/// to enforce "more terms is better"; arithmetic already does.
+/// does on its own, by summing one contribution per term present.
 ///
-/// This replaced an intersection, and the reason is worth keeping: requiring
-/// every term is a fine rule for the two or three words someone types into a
-/// box, and it collapses on a query that is a sentence. On the Cranfield
-/// collection, 225 questions averaging seventeen words, exactly four had any
-/// document at all containing every term. Intersection answered three of them.
+/// The naive way to do that is to walk every posting of every term, and it is
+/// what this did first. The problem is the commonest word: `the` is in a third
+/// of the corpus, none of those documents wins on `the`, and walking them all
+/// costs more than the rest of the query put together.
 ///
-/// The cursors are the same ones the intersection used, so a term still skips
-/// blocks instead of decoding them. What is gone is the pivot: a union cannot
-/// jump past a document just because one term is missing from it, because that
-/// document may still be a good answer.
+/// So this is `MaxScore`. Every term has a ceiling — the largest contribution
+/// any document could take from it, which is the maximum block bound the
+/// indexer already wrote, times the query's `idf`. Terms are split into two
+/// groups against the current k-th best score: the *essential* ones, whose
+/// ceilings still add up to something that could beat it, and the rest. Only
+/// the essential terms are walked. The others are looked up by seek, on the
+/// documents the essential ones proposed, which is a skip-list jump instead of
+/// a scan.
+///
+/// As the heap fills the threshold rises and more terms fall out of the walk.
+/// When every term has, nothing left can beat what is already held, and the
+/// query stops.
+///
+/// `MaxScore` rather than WAND because the arithmetic is a suffix sum instead of
+/// a pivot search, and this has to be *exactly* as correct as the exhaustive
+/// walk: `maxscore_returns_exactly_what_the_exhaustive_union_returns` compares
+/// them hit for hit and score for score.
 fn union(
     segment: &Segment,
     query: &Query,
@@ -280,39 +292,335 @@ fn union(
     global: Option<&GlobalStats>,
     total_docs: usize,
 ) -> Result<Vec<Hit>> {
-    let terms = query.scoring_terms();
-    if terms.is_empty() {
+    let Some(mut state) = Scan::open(segment, query, limit, global, total_docs)? else {
         return Ok(Vec::new());
+    };
+    state.run(segment, limit)?;
+    Ok(finish(state.heap, segment, limit))
+}
+
+/// One term of the query, ready to be walked or looked up.
+struct Term<'a> {
+    /// The query's `idf` for this term, which the stored bounds do not include.
+    idf: f32,
+    /// `idf` times the largest bound any block of this term carries: the most
+    /// this term could ever contribute to any document's score.
+    ceiling: f32,
+    cursor: PostingsCursor<'a>,
+}
+
+/// Everything one union scan needs, so the walk itself stays readable.
+struct Scan<'a> {
+    /// In `scoring_terms` order — sorted — and never reordered. Scores are
+    /// summed in this order in every process, because floating-point addition
+    /// is not associative and two shards holding the same segment have to
+    /// agree to the last bit.
+    terms: Vec<Term<'a>>,
+    /// Indices into `terms`, ordered by ceiling ascending. The walk and the
+    /// threshold arithmetic use this; the summation never does.
+    by_ceiling: Vec<usize>,
+    excluded: Vec<PostingsCursor<'a>>,
+    /// `prefix[i]` is the total ceiling of `by_ceiling[..i]`: the most a
+    /// document could score from those terms alone.
+    prefix: Vec<f32>,
+    heap: BinaryHeap<Ranked>,
+    average_length: f32,
+    params: crate::scoring::Params,
+    total_docs: usize,
+    /// Whether the stored block bounds are upper bounds for *this* query.
+    ///
+    /// They are computed when the segment is written, with that segment's own
+    /// average document length and its own document count. A query scoring
+    /// with corpus-wide statistics uses neither: a shard whose documents are
+    /// shorter than the corpus average gets a smaller length normalisation,
+    /// which makes every saturation *larger* than the bound recorded for it.
+    /// Measured on a segment averaging 25 tokens against a corpus averaging
+    /// 400, the real maximum contribution exceeded the stored bound by 6% to
+    /// 16% for every term tried.
+    ///
+    /// Pruning on a bound that does not bound is not slow, it is wrong: it
+    /// drops documents that belonged in the results, and nothing says so. So
+    /// when the numbers do not match what the bounds were built with, the
+    /// walk is exhaustive.
+    ///
+    /// The fix that would let a shard prune too is to store what the bound is
+    /// made of — the block's largest weighted frequency, its shortest document
+    /// and its highest rank — instead of the finished number, and to compute
+    /// the bound at query time. That is a segment format change.
+    bounds_hold: bool,
+}
+
+impl<'a> Scan<'a> {
+    fn open(
+        segment: &'a Segment,
+        query: &Query,
+        limit: usize,
+        global: Option<&GlobalStats>,
+        total_docs: usize,
+    ) -> Result<Option<Self>> {
+        let names = query.scoring_terms();
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let mut terms = Vec::with_capacity(names.len());
+        for name in &names {
+            let cursor = segment.cursor(name, false)?;
+            // A term this segment has never seen contributes nothing. Under
+            // intersection it meant the query could not match at all; under
+            // union it is one fewer thing to add up.
+            if cursor.doc().is_none() {
+                continue;
+            }
+            let doc_freq = global
+                .and_then(|g| g.doc_freq.get(name).copied())
+                .unwrap_or_else(|| cursor.document_frequency());
+            let idf = idf(total_docs, doc_freq);
+            let highest = cursor
+                .block_starts()
+                .iter()
+                .map(|&(_, _, bound)| bound)
+                .fold(0.0f32, f32::max);
+            terms.push(Term {
+                idf,
+                ceiling: idf * highest,
+                cursor,
+            });
+        }
+        if terms.is_empty() {
+            return Ok(None);
+        }
+
+        let mut by_ceiling: Vec<usize> = (0..terms.len()).collect();
+        // Ties broken by index so the split point is the same every run.
+        by_ceiling.sort_by(|&a, &b| {
+            terms[a]
+                .ceiling
+                .partial_cmp(&terms[b].ceiling)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let mut prefix = Vec::with_capacity(terms.len() + 1);
+        let mut running = 0.0f32;
+        prefix.push(0.0);
+        for &i in &by_ceiling {
+            running += terms[i].ceiling;
+            prefix.push(running);
+        }
+
+        // Excluded terms get cursors too, so exclusion is a skip rather than a
+        // scan of the excluded term's entire list.
+        let mut excluded = Vec::with_capacity(query.excluded.len());
+        for term in &query.excluded {
+            excluded.push(segment.cursor(term, false)?);
+        }
+
+        let average_length = global
+            .map_or_else(
+                || segment.average_document_length(),
+                GlobalStats::average_length,
+            )
+            .max(1.0);
+
+        Ok(Some(Self {
+            terms,
+            by_ceiling,
+            excluded,
+            prefix,
+            heap: BinaryHeap::with_capacity(limit.min(1024).saturating_add(1)),
+            average_length,
+            params: segment.params(),
+            total_docs,
+            bounds_hold: global.is_none(),
+        }))
     }
 
-    // In `scoring_terms` order, which is sorted, so contributions are summed
-    // the same way in every process. Floating-point addition is not
-    // associative and two shards must agree to the last bit.
-    let mut cursors = Vec::with_capacity(terms.len());
-    for term in &terms {
-        let cursor = segment.cursor(term, false)?;
-        // A term this segment has never seen contributes nothing. Under
-        // intersection it meant the query could not match at all; under union
-        // it is simply one fewer thing to add up.
+    /// The k-th best score so far; zero until the heap is full, which is what
+    /// makes the first `limit` documents unprunable.
+    fn threshold(&self, limit: usize) -> f32 {
+        if self.heap.len() < limit {
+            0.0
+        } else {
+            self.heap.peek().map_or(0.0, |Ranked(score, _)| *score)
+        }
+    }
+
+    /// How many of the lowest-ceilinged terms cannot, together, beat the
+    /// threshold. Those are looked up rather than walked.
+    fn non_essential(&self, threshold: f32) -> usize {
+        if !self.bounds_hold {
+            return 0;
+        }
+        // `prefix` ascends, so this is the last index whose total still fails
+        // to reach the threshold.
+        self.prefix
+            .iter()
+            .position(|&total| total > threshold)
+            .unwrap_or(self.prefix.len())
+            .saturating_sub(1)
+    }
+
+    fn run(&mut self, segment: &Segment, limit: usize) -> Result<()> {
+        loop {
+            let threshold = self.threshold(limit);
+            let split = self.non_essential(threshold);
+            // Every term is non-essential: nothing left in the corpus can beat
+            // what is already held.
+            if split >= self.terms.len() {
+                return Ok(());
+            }
+            let Some(doc) = self.by_ceiling[split..]
+                .iter()
+                .filter_map(|&i| self.terms[i].cursor.doc())
+                .min()
+            else {
+                return Ok(());
+            };
+
+            // Splitting terms into essential and not does nothing for a query
+            // of one term, because that term is always essential. What helps
+            // there is the block: if the best any document in this term's
+            // current block could score, joined by the most every other term
+            // could ever add, still cannot beat the threshold, then none of
+            // those 128 documents can, and the whole block goes unread.
+            if self.bounds_hold && self.skip_hopeless_block(doc, threshold, split)? {
+                continue;
+            }
+
+            self.consider(segment, doc, threshold, split, limit)?;
+
+            // Advance every essential cursor sitting on this document. The
+            // non-essential ones are left where the seeks put them; they are
+            // never walked, only asked about.
+            for &i in &self.by_ceiling[split..] {
+                if self.terms[i].cursor.doc() == Some(doc) {
+                    self.terms[i].cursor.advance()?;
+                }
+            }
+        }
+    }
+
+    /// Skips the block holding `doc` when nothing in it can reach the
+    /// threshold, and says whether it did.
+    ///
+    /// Only the cursor actually sitting on `doc` is skipped. The others are
+    /// further ahead and their blocks have not been ruled out.
+    fn skip_hopeless_block(&mut self, doc: DocId, threshold: f32, split: usize) -> Result<bool> {
+        let total_ceiling = self.prefix[self.prefix.len() - 1];
+        let Some(&at) = self.by_ceiling[split..]
+            .iter()
+            .find(|&&i| self.terms[i].cursor.doc() == Some(doc))
+        else {
+            return Ok(false);
+        };
+        let term = &self.terms[at];
+        // This block's best, plus the most everything else could ever add.
+        let best = term.idf * term.cursor.block_bound() + (total_ceiling - term.ceiling);
+        if best > threshold {
+            return Ok(false);
+        }
+        let block = term.cursor.current_block();
+        self.terms[at].cursor.skip_block()?;
+        // A block that does not move is the last one; walking it is the only
+        // way to finish, and skipping forever would not terminate.
+        Ok(self.terms[at].cursor.current_block() != block)
+    }
+
+    /// Scores one document, unless something cheaper rules it out first.
+    fn consider(
+        &mut self,
+        segment: &Segment,
+        doc: DocId,
+        threshold: f32,
+        split: usize,
+        limit: usize,
+    ) -> Result<()> {
+        for cursor in &mut self.excluded {
+            cursor.seek(doc)?;
+            if cursor.doc() == Some(doc) {
+                return Ok(());
+            }
+        }
+        let Some((length, rank)) = segment.doc_lengths(doc) else {
+            return Ok(());
+        };
+        let length_norm = self.params.length_norm(length, self.average_length);
+
+        // The essential terms' real contribution, plus the most the
+        // non-essential ones could add. With every term essential this is the
+        // exact score, and the test below is simply "would it make the heap".
+        let mut optimistic = self.prefix[split];
+        for &i in &self.by_ceiling[split..] {
+            let term = &self.terms[i];
+            if term.cursor.doc() == Some(doc) {
+                optimistic += term.idf
+                    * self
+                        .params
+                        .saturation(term.cursor.weighted_frequency(), length_norm);
+            }
+        }
+        if optimistic * self.params.authority(rank, self.total_docs) <= threshold {
+            return Ok(());
+        }
+
+        // Look the non-essential terms up on this document.
+        for &i in &self.by_ceiling[..split] {
+            self.terms[i].cursor.seek(doc)?;
+        }
+
+        // Summed in canonical term order, never in ceiling order, so the score
+        // is bit-for-bit what the exhaustive walk would have produced.
+        let mut score = 0.0f32;
+        for term in &self.terms {
+            if term.cursor.doc() == Some(doc) {
+                score += term.idf
+                    * self
+                        .params
+                        .saturation(term.cursor.weighted_frequency(), length_norm);
+            }
+        }
+        score *= self.params.authority(rank, self.total_docs);
+
+        self.heap.push(Ranked(score, doc));
+        if self.heap.len() > limit {
+            self.heap.pop();
+        }
+        Ok(())
+    }
+}
+
+/// The union walked in full, with no pruning at all.
+///
+/// This is not used to answer queries. It exists so the optimised path has
+/// something to be *identical* to: an optimisation that returns nearly the
+/// right answers is a bug that only shows up in results nobody notices are
+/// missing.
+#[cfg(test)]
+fn union_exhaustive(
+    segment: &Segment,
+    query: &Query,
+    limit: usize,
+    global: Option<&GlobalStats>,
+    total_docs: usize,
+) -> Result<Vec<Hit>> {
+    let names = query.scoring_terms();
+    let mut cursors = Vec::new();
+    for name in &names {
+        let cursor = segment.cursor(name, false)?;
         if cursor.doc().is_none() {
             continue;
         }
         let doc_freq = global
-            .and_then(|g| g.doc_freq.get(term).copied())
+            .and_then(|g| g.doc_freq.get(name).copied())
             .unwrap_or_else(|| cursor.document_frequency());
         cursors.push((idf(total_docs, doc_freq), cursor));
     }
     if cursors.is_empty() {
         return Ok(Vec::new());
     }
-
-    // Excluded terms get cursors too, so exclusion is a skip rather than a
-    // scan of the excluded term's entire list.
-    let mut excluded = Vec::with_capacity(query.excluded.len());
+    let mut excluded = Vec::new();
     for term in &query.excluded {
         excluded.push(segment.cursor(term, false)?);
     }
-
     let average_length = global
         .map_or_else(
             || segment.average_document_length(),
@@ -320,10 +628,8 @@ fn union(
         )
         .max(1.0);
     let params = segment.params();
-    let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.min(1024).saturating_add(1));
+    let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit.saturating_add(1));
 
-    // The lowest document any cursor is sitting on. Every cursor ascends, so
-    // this walks the union in document order without a merge buffer.
     while let Some(doc) = cursors.iter().filter_map(|(_, c)| c.doc()).min() {
         let mut dropped = false;
         for cursor in &mut excluded {
@@ -333,7 +639,6 @@ fn union(
                 break;
             }
         }
-
         if !dropped {
             if let Some((length, rank)) = segment.doc_lengths(doc) {
                 let length_norm = params.length_norm(length, average_length);
@@ -351,14 +656,12 @@ fn union(
                 }
             }
         }
-
         for (_, cursor) in &mut cursors {
             if cursor.doc() == Some(doc) {
                 cursor.advance()?;
             }
         }
     }
-
     Ok(finish(heap, segment, limit))
 }
 
@@ -479,6 +782,103 @@ fn intersect(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
 mod tests {
     use super::*;
     use crate::scoring::authority;
+
+    /// A corpus with a very common term, a rare one, and lengths that vary,
+    /// so pruning has something to prune and getting it wrong is visible.
+    fn skewed(n: usize) -> Segment {
+        let mut builder = crate::builder::SegmentBuilder::new();
+        for i in 0..n {
+            let mut body = String::new();
+            // In almost every document, and never decisive.
+            for _ in 0..=(i % 3) {
+                body.push_str("comun ");
+            }
+            if i % 97 == 0 {
+                body.push_str("raro raro ");
+            }
+            if i % 13 == 0 {
+                body.push_str("medio ");
+            }
+            if i % 7 == 0 {
+                body.push_str("ruido ");
+            }
+            // Lengths that vary by an order of magnitude.
+            body.push_str(&"relleno ".repeat(i % 40 + 1));
+            builder.add(&indexander_core::Document::new(
+                format!("doc://{i:05}"),
+                format!("doc {i}"),
+                body,
+            ));
+        }
+        Segment::from_bytes(builder.encode()).expect("segment")
+    }
+
+    #[test]
+    fn maxscore_returns_exactly_what_the_exhaustive_union_returns() {
+        let segment = skewed(4000);
+        let queries = [
+            "comun",
+            "raro",
+            "comun raro",
+            "comun medio ruido",
+            "comun raro medio ruido relleno",
+            "raro -medio",
+            "comun -raro",
+            "ausente",
+            "comun ausente",
+        ];
+        for text in queries {
+            let parsed = crate::query::parse(text);
+            for limit in [1usize, 3, 10, 50, 500] {
+                let fast = search(&segment, &parsed, limit).expect("search");
+                let slow =
+                    union_exhaustive(&segment, &parsed, limit, None, segment.document_count())
+                        .expect("reference");
+                assert_eq!(
+                    fast.len(),
+                    slow.len(),
+                    "{text:?} at limit {limit}: different number of hits"
+                );
+                for (a, b) in fast.iter().zip(&slow) {
+                    assert_eq!(a.uri, b.uri, "{text:?} at limit {limit}: different order");
+                    assert_eq!(
+                        a.score.to_bits(),
+                        b.score.to_bits(),
+                        "{text:?} at limit {limit}: {} scored {} not {}",
+                        a.uri,
+                        a.score,
+                        b.score
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pruning_agrees_with_the_exhaustive_walk_when_shard_statistics_are_supplied() {
+        // Global statistics change every idf, and therefore every ceiling and
+        // the whole split between essential and non-essential terms.
+        let segment = skewed(1500);
+        let parsed = crate::query::parse("comun raro medio");
+        let mut stats = GlobalStats::default();
+        stats.add_shard(
+            100_000,
+            40_000_000,
+            &[
+                ("comun".to_owned(), 90_000),
+                ("raro".to_owned(), 12),
+                ("medio".to_owned(), 4_000),
+            ],
+        );
+        let fast = search_with_stats(&segment, &parsed, 20, Some(&stats)).expect("search");
+        let slow =
+            union_exhaustive(&segment, &parsed, 20, Some(&stats), stats.total_docs).expect("ref");
+        assert_eq!(fast.len(), slow.len());
+        for (a, b) in fast.iter().zip(&slow) {
+            assert_eq!(a.uri, b.uri);
+            assert_eq!(a.score.to_bits(), b.score.to_bits());
+        }
+    }
 
     #[test]
     fn intersection_keeps_only_common_ascending() {
