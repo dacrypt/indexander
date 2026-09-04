@@ -20,6 +20,8 @@ indexander.ixdr -> 222.6 MiB (31.7% of 702.2 MiB of text)
 
 $ indexander search "inverted index" -perl --limit 5
   1.  11.8402  /corpus/design/postings.md
+       …a postings list is a sorted run of document ids, and the whole point of
+       an inverted index is that it can be walked without…
   2.   9.6631  /corpus/notes/lucene.md
   ...
 5 results in 1.20ms over 103257 documents
@@ -37,7 +39,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.557 MRR on known-item queries, and an ablation showing the number moves when the ranker is broken |
-| Tests | 357, including full crawls and eight-shard queries over real sockets |
+| Tests | 373, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -633,6 +635,31 @@ TREC topics and qrels in, P@k / nDCG@k / MAP / MRR out. It also prints how many
 returned documents nobody judged, because a run where that number is large is
 describing the judgements more than the engine.
 
+## Snippets
+
+A ranked list of URIs is not a search engine's output, it is its intermediate
+state. What a person reads is the extract underneath.
+
+```console
+$ indexander search inverted index --limit 1
+  1.  13.4645  .../arm/generic/bignum_mul.S
+     …#3 add yy, yy, y // And index using the loop counter i = b - a, …
+     …Lbignum_mul_outerloop // Inverted carry flag! Lbignum_mul_end:…
+```
+
+Two fragments there, not one, and that is the point. On a real document the two
+words someone typed are usually nowhere near each other, so the single best
+160-byte window contains one of them and drops the other — which was exactly
+what this printed until the output above was looked at. The extract is now up
+to three fragments, each chosen to bring a word the others did not have.
+
+Snippets are cut from the document's own text rather than from the index. The
+index stores positions in *tokens*, which say nothing about where a word is in
+the bytes, and the folded term `busqueda` is not what anyone wants to read
+where the document says `BÚSQUEDA`. The one thing shared with the index is the
+tokenizer — a single scanner, so what is highlighted is exactly what matched
+rather than nearly.
+
 ## Query syntax
 
 ```text
@@ -677,7 +704,12 @@ Stated plainly, because a README that only lists what works is a sales page:
 - **A judged collection.** Ranking is measured against known-item queries,
   which have one right answer and need no human. What documents are *about* is
   a harder question and needs judgements this repository does not have.
-- **Snippets.** Positions are stored, so highlighted extracts are a query away.
+- **A document store.** Snippets are cut from the document's text, read back
+  from its uri. That works for a corpus of files and not for a crawl, whose
+  uris are URLs — and re-fetching a page to decorate a result line is not a
+  thing to do. Keeping the text would roughly quadruple the index, since the
+  index is a third of the text it indexes, so this is a decision waiting on
+  someone who needs it rather than an oversight.
 - **An HTTP API and a UI.** There is a CLI and a library.
 - **A real HTML parser.** `crates/crawl/src/extract.rs` is a scanner, not a
   parser: it walks the bytes once and never builds a tree. It handles the

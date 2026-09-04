@@ -30,6 +30,7 @@ use indexander_index::query;
 use indexander_index::scoring::Params;
 use indexander_index::search::search;
 use indexander_index::segment::Segment;
+use indexander_index::snippet;
 use indexander_rank::graph::GraphBuilder;
 use indexander_rank::pagerank::{Options as RankOptions, pagerank};
 use url::Url;
@@ -785,8 +786,12 @@ fn cmd_search(args: &[String]) -> Result<(), String> {
         println!("no results ({elapsed:.2?})");
         return Ok(());
     }
+    let terms = parsed.scoring_terms();
     for (rank, hit) in hits.iter().enumerate() {
         println!("{:>3}. {:>8.4}  {}", rank + 1, hit.score, hit.uri);
+        if let Some(line) = snippet_for(&hit.uri, &terms) {
+            println!("     {line}");
+        }
     }
     println!(
         "\n{} result{} in {:.2?} over {} documents",
@@ -796,6 +801,35 @@ fn cmd_search(args: &[String]) -> Result<(), String> {
         segment.document_count()
     );
     Ok(())
+}
+
+/// How much of a document to show under its result.
+const SNIPPET_WIDTH: usize = 160;
+
+/// The extract for one hit, or nothing if its text cannot be read back.
+///
+/// Snippets are not stored, so this re-reads the document. That works when the
+/// uri is a path, which is what `indexander index` produces; a crawled `http://`
+/// uri is not something to go and fetch again to decorate a result line, so
+/// those results print without one rather than pretending.
+fn snippet_for(uri: &str, terms: &[String]) -> Option<String> {
+    let raw = std::fs::read(Path::new(uri)).ok()?;
+    if is_binary(&raw) {
+        return None;
+    }
+    let extract = snippet::best(&decode(raw), terms, SNIPPET_WIDTH);
+    if extract.text.is_empty() {
+        return None;
+    }
+    // Bold, with an explicit reset - not a colour, which a third of readers
+    // would see as the same grey as the rest.
+    Some(
+        extract
+            .wrap("\u{1b}[1m", "\u{1b}[0m")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 fn cmd_stats(args: &[String]) -> Result<(), String> {

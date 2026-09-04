@@ -21,6 +21,21 @@ pub struct Token {
     pub position: Position,
 }
 
+/// A term, and where it appeared in the *bytes* of the text it came from.
+///
+/// The index has no use for this — postings are addressed by token position —
+/// but a snippet does: it has to cut the original text, with its accents and
+/// capitals intact, and a token position says nothing about where that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    /// The folded term, comparable with what the index and query hold.
+    pub text: String,
+    pub position: Position,
+    /// Byte range in the original text. Always on character boundaries.
+    pub start: usize,
+    pub end: usize,
+}
+
 /// Folds one character to its unaccented ASCII form.
 ///
 /// Returns the character unchanged when it has no accent to strip. Never
@@ -59,35 +74,58 @@ pub fn fold_char(c: char) -> char {
 /// how a document's anchor texts share one position space.
 pub fn tokenize_into(text: &str, start: Position, out: &mut Vec<Token>) -> Position {
     let mut position = start;
+    scan(text, |text, _, _| {
+        out.push(Token { text, position });
+        position += 1;
+    });
+    position
+}
+
+/// The one scanner. Everything that splits text into terms goes through here.
+///
+/// Two scanners that fold slightly differently would put a term in the index
+/// that a query could not find, or highlight a word a search did not match.
+/// The callback takes the byte range so the callers that need it have it and
+/// the ones that do not pay nothing for it — it is two `usize`s the optimiser
+/// drops.
+fn scan(text: &str, mut emit: impl FnMut(String, usize, usize)) {
     let mut current = String::new();
+    let mut start = 0usize;
 
-    // Push whatever has accumulated, if anything, and advance the position.
-    macro_rules! flush {
-        () => {
-            if !current.is_empty() {
-                out.push(Token {
-                    text: std::mem::take(&mut current),
-                    position,
-                });
-                position += 1;
-            }
-        };
-    }
-
-    for c in text.chars() {
+    for (at, c) in text.char_indices() {
         if c.is_alphanumeric() {
+            if current.is_empty() {
+                start = at;
+            }
             // `to_lowercase` is an iterator because some characters lowercase
             // to several (ẞ -> ss). Fold after lowercasing, never before.
             for lower in c.to_lowercase() {
                 current.push(fold_char(lower));
             }
-        } else {
-            flush!();
+        } else if !current.is_empty() {
+            emit(std::mem::take(&mut current), start, at);
         }
     }
-    flush!();
+    if !current.is_empty() {
+        emit(current, start, text.len());
+    }
+}
 
-    position
+/// Splits `text` into terms that remember where in the bytes they were.
+#[must_use]
+pub fn tokenize_spans(text: &str) -> Vec<Span> {
+    let mut out = Vec::new();
+    let mut position = 0;
+    scan(text, |text, start, end| {
+        out.push(Span {
+            text,
+            position,
+            start,
+            end,
+        });
+        position += 1;
+    });
+    out
 }
 
 /// Convenience wrapper over [`tokenize_into`] for a single string.
@@ -110,6 +148,49 @@ pub fn fold(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spans_and_tokens_are_the_same_terms() {
+        // One scanner, so this can only fail if someone splits it into two.
+        for text in [
+            "",
+            "   ",
+            "Búsqueda en Español",
+            "a-b_c 42 ¡hola! ñandú",
+            "trailing",
+            "ẞ and ß",
+        ] {
+            let tokens = tokenize(text);
+            let spans = tokenize_spans(text);
+            assert_eq!(tokens.len(), spans.len(), "{text:?}");
+            for (t, s) in tokens.iter().zip(&spans) {
+                assert_eq!(t.text, s.text, "{text:?}");
+                assert_eq!(t.position, s.position, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_span_points_at_the_original_word_accents_and_all() {
+        let text = "El motor de BÚSQUEDA";
+        let spans = tokenize_spans(text);
+        assert_eq!(spans[3].text, "busqueda");
+        assert_eq!(&text[spans[3].start..spans[3].end], "BÚSQUEDA");
+        assert_eq!(spans[1].text, "motor");
+        assert_eq!(&text[spans[1].start..spans[1].end], "motor");
+    }
+
+    #[test]
+    fn spans_are_in_order_and_never_overlap() {
+        let text = "uno, dos; tres — cuatro";
+        let spans = tokenize_spans(text);
+        assert!(spans.windows(2).all(|w| w[0].end <= w[1].start));
+        assert!(spans.iter().all(|s| s.start < s.end && s.end <= text.len()));
+        // Every range is sliceable, which is the property that matters.
+        for s in &spans {
+            let _ = &text[s.start..s.end];
+        }
+    }
 
     /// The bug this engine exists to not repeat.
     ///

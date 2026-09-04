@@ -7,4 +7,5 @@ pub mod query;
 pub mod scoring;
 pub mod search;
 pub mod segment;
+pub mod snippet;
 pub mod tokenizer;
