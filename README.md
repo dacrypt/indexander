@@ -36,7 +36,8 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 303, including full crawls and eight-shard queries over real sockets |
+| Result quality | 0.557 MRR on known-item queries, and an ablation showing the number moves when the ranker is broken |
+| Tests | 335, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -548,6 +549,59 @@ one cursor per term advances monotonically. The first version looked each
 candidate up with a linear scan; replacing that took a query over 103k documents
 from 37.31 ms to 1.43 ms.
 
+## Are the results any good?
+
+Every test above this line checks that two paths agree: that a merged index
+scores like the segments it came from, that a cluster returns what a single
+index would, that a rebuild is byte-identical. All of them are satisfied by a
+ranker that puts the worst document first, as long as it does so reproducibly.
+
+`indexander known-item` asks the other question, and needs nobody's opinion to
+do it. It lifts a span of words out of a document and checks where that
+document lands. Every term is required and the document contains all of them,
+so it is in the results by construction — the only thing being measured is
+where it sits among the others that also qualify.
+
+```console
+$ indexander known-item ~/.cargo/registry/src/index.crates.io-* --sample 400
+known-item: 6-word spans from the body of each document, seed 1
+over 7661 documents
+
+  MRR                      0.5397
+  nDCG@10                  0.5808
+  success@1                0.4297
+  success@10               0.7417   (101 answers outside the top 10, 9 past rank 100)
+
+391 queries in 58.70ms, 9 documents too short to ask
+```
+
+Spans are picked uniformly at random and no attempt is made to prefer
+distinctive ones, because preferring them is exactly where a benchmark gets
+tuned without anybody deciding to tune it.
+
+A number is worth nothing until it moves. Breaking the scorer on purpose, on
+the same seed:
+
+| ranker | MRR | success@1 |
+|---|---|---|
+| as shipped | 0.5920 | 0.4658 |
+| no length normalisation | 0.3734 | 0.2397 |
+| no saturation | 0.4884 | 0.3493 |
+| no idf | 0.5752 | 0.4384 |
+| no field weights | 0.5910 | 0.4658 |
+
+The first two are unambiguous. The last two are *inside* the seed-to-seed
+variation and that table cannot tell them from noise — paired across five
+seeds it can, and both come out consistently positive but small. The full
+argument, the corpus, why titles score worse than bodies here through no fault
+of the ranker, and what none of these numbers mean, are in
+[docs/EVALUATION.md](docs/EVALUATION.md).
+
+`indexander eval` is the other half, for when somebody has judged a collection:
+TREC topics and qrels in, P@k / nDCG@k / MAP / MRR out. It also prints how many
+returned documents nobody judged, because a run where that number is large is
+describing the judgements more than the engine.
+
 ## Query syntax
 
 ```text
@@ -570,10 +624,11 @@ crates/crawl   robots.txt, HTML extraction, URL normalisation, frontier, fetch
 crates/rank    the link graph as CSR, and PageRank over it
 crates/proto   the coordinator/shard wire protocol and shard routing
 crates/cluster the coordinator and shard roles, over TCP
+crates/eval    relevance metrics, TREC qrels, and known-item sampling
 crates/cli     the `indexander` binary
 ```
 
-`core`, `rank` and `proto` depend on nothing but the standard library. `index`
+`core`, `rank`, `proto` and `eval` depend on nothing but the standard library. `index`
 depends on `memmap2` and nothing else. The crawler and the cluster are where
 the dependencies live, because writing an HTTP client, a TLS stack and an async
 runtime from scratch would be three different projects.
@@ -587,16 +642,9 @@ Stated plainly, because a README that only lists what works is a sales page:
   just merged.
 - **Sweeping orphans.** They are listed, never deleted. Deciding a file is
   unreferenced is easy; deciding nobody is still reading it is not.
-- **Segment merging.** One segment per index today. Real corpora need many,
-  written incrementally and merged in the background.
-- **Block-max scoring.** Blocks are skipped when no document in them can
-  match; they are not yet skipped when no document in them can *score* high
-  enough to reach the current top-k. That needs a per-block score bound stored
-  alongside the skip index.
-- **The document store on disk.** The 32 MB a shard holds resident is every
-  document's URI, field lengths and rank, parsed up front.
-- **Concurrency.** Indexing is single threaded on a 14-core machine. The
-  per-document work is independent; this is the largest easy win available.
+- **A judged collection.** Ranking is measured against known-item queries,
+  which have one right answer and need no human. What documents are *about* is
+  a harder question and needs judgements this repository does not have.
 - **Snippets.** Positions are stored, so highlighted extracts are a query away.
 - **An HTTP API and a UI.** There is a CLI and a library.
 - **A real HTML parser.** `crates/crawl/src/extract.rs` is a scanner, not a

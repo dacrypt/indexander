@@ -7,6 +7,8 @@
 //! subcommands and adding a dependency to parse them would be the first step
 //! toward a startup time we would then have to defend.
 
+mod eval;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -45,6 +47,9 @@ USAGE:
     indexander search <query>... [--index <segment>] [--limit <n>]
                                  [--shards <addr,addr,...>]
     indexander stats [--index <segment>]
+    indexander eval  --queries <file> --qrels <file> [--index <segment>] [--k <n>]
+    indexander known-item <directory> [--index <segment>] [--from body|title]
+                          [--sample <n>] [--span <n>] [--seed <n>] [--k <n>]
 
 The default segment path is ./indexander.ixdr
 
@@ -59,6 +64,8 @@ EXAMPLES:
     indexander sync ./replica --from 127.0.0.1:7801
     indexander crawl https://example.com --leases 127.0.0.1:7900
     indexander search motor --shards 127.0.0.1:7801,127.0.0.1:7802
+    indexander known-item ./docs --sample 500
+    indexander eval --queries topics.tsv --qrels qrels.txt --k 10
 ";
 
 const DEFAULT_SEGMENT: &str = "indexander.ixdr";
@@ -88,6 +95,8 @@ fn run(args: &[String]) -> Result<(), String> {
         "index" => cmd_index(&args[1..]),
         "search" => cmd_search(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
+        "eval" => eval::cmd_eval(&args[1..]),
+        "known-item" => eval::cmd_known_item(&args[1..]),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
@@ -101,7 +110,7 @@ fn run(args: &[String]) -> Result<(), String> {
 }
 
 /// Pulls `--name value` out of `args`, leaving the rest untouched.
-fn take_option(args: &[String], name: &str) -> (Option<String>, Vec<String>) {
+pub(crate) fn take_option(args: &[String], name: &str) -> (Option<String>, Vec<String>) {
     let mut rest = Vec::with_capacity(args.len());
     let mut value = None;
     let mut iter = args.iter();
@@ -761,7 +770,7 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn open_segment(path: Option<&str>) -> Result<Segment, String> {
+pub(crate) fn open_segment(path: Option<&str>) -> Result<Segment, String> {
     let path = Path::new(path.unwrap_or(DEFAULT_SEGMENT));
     Segment::open(path).map_err(|e| {
         if path.exists() {
@@ -776,7 +785,7 @@ fn open_segment(path: Option<&str>) -> Result<Segment, String> {
 }
 
 /// Every readable file under `root`, depth first. Hidden entries are skipped.
-fn collect_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn collect_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     if !root.exists() {
         return Err(format!("{} does not exist", root.display()));
     }
@@ -814,7 +823,7 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, String> {
 /// lost and nothing fails, which is more than can be said for refusing to read
 /// the file at all. Real charset detection belongs here later; skipping the
 /// document does not.
-fn decode(raw: Vec<u8>) -> String {
+pub(crate) fn decode(raw: Vec<u8>) -> String {
     match String::from_utf8(raw) {
         Ok(text) => text,
         Err(e) => e.into_bytes().into_iter().map(|b| b as char).collect(),
@@ -822,7 +831,7 @@ fn decode(raw: Vec<u8>) -> String {
 }
 
 /// A NUL byte in the first few KiB means this is not text.
-fn is_binary(raw: &[u8]) -> bool {
+pub(crate) fn is_binary(raw: &[u8]) -> bool {
     raw.iter().take(8192).any(|&b| b == 0)
 }
 

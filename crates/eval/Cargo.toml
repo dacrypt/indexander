@@ -1,0 +1,18 @@
+[package]
+name = "indexander-eval"
+description = "Measuring whether the results are any good, not just whether they are consistent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+indexander-core = { version = "0.1.0", path = "../core" }
+indexander-index = { version = "0.1.0", path = "../index" }
+
+[lints]
+workspace = true

@@ -16,6 +16,7 @@ path = "src/main.rs"
 indexander-cluster = { version = "0.1.0", path = "../cluster" }
 indexander-core.workspace = true
 indexander-crawl = { version = "0.1.0", path = "../crawl" }
+indexander-eval.workspace = true
 indexander-index.workspace = true
 indexander-rank = { version = "0.1.0", path = "../rank" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

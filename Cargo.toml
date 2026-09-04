@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/index", "crates/crawl", "crates/rank", "crates/proto", "crates/cluster", "crates/cli"]
+members = ["crates/core", "crates/index", "crates/crawl", "crates/rank", "crates/proto", "crates/cluster", "crates/eval", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,7 @@ indexander-crawl = { path = "crates/crawl", version = "0.1.0" }
 indexander-rank = { path = "crates/rank", version = "0.1.0" }
 indexander-proto = { path = "crates/proto", version = "0.1.0" }
 indexander-cluster = { path = "crates/cluster", version = "0.1.0" }
+indexander-eval = { path = "crates/eval", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
