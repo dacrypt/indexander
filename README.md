@@ -36,7 +36,7 @@ language and the ranking are real and tested end to end.
 | Index size | 35% of the text it indexes |
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
-| Tests | 236, including full crawls and eight-shard queries over real sockets |
+| Tests | 244, including full crawls and eight-shard queries over real sockets |
 | Memory | 32 MB resident to serve a 236 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -222,7 +222,16 @@ that looks plausible and is wrong:
 `many_shards_match_one_process` runs the same graph across 2, 3, 5, 8 and 17
 shards and checks every rank against the single-process answer;
 `the_ranking_order_survives_partitioning` checks the thing a user would
-actually notice.
+actually notice. `several_shards_over_sockets_match_one_process` does it again
+with the shards in separate tasks talking over real TCP, because the ordering
+of the three exchanges is exactly the sort of thing that survives a rewrite as
+data structures and breaks as messages.
+
+Routing is the coordinator's job, not the shards'. A shard emitting a
+contribution says only "not mine"; letting each shard route would require every
+one of them to agree on the routing function *and* the shard count, and a
+disagreement does not error — the contribution lands somewhere that does not
+own the page, is dropped, and the ranking is quietly short.
 
 ### Politeness belongs to one node per host
 
@@ -429,11 +438,6 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **The transport for distributed PageRank.** The algorithm is built and
-  tested — splitting a graph across seventeen shards gives the same ranks and
-  the same order as one process — but its three exchanges are still data
-  structures rather than messages on a socket. Step 4 of
-  `docs/DISTRIBUTION.md`.
 - **Replication.** Segments are immutable files, which makes this the easy
   part, and it is not done. Step 5.
 - **A shared `robots.txt` cache.** The lease authority paces requests but does

@@ -16,6 +16,7 @@ indexander-core = { version = "0.1.0", path = "../core" }
 indexander-crawl = { version = "0.1.0", path = "../crawl" }
 indexander-index = { version = "0.1.0", path = "../index" }
 indexander-proto = { version = "0.1.0", path = "../proto" }
+indexander-rank = { version = "0.1.0", path = "../rank" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 
 [dev-dependencies]

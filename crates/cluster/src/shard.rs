@@ -66,12 +66,21 @@ pub fn handle(segment: &Segment, request: &Request) -> Response {
             terms: segment.term_count(),
             average_length: segment.average_document_length(),
         },
-        // A shard serves an index; rate limits belong to a lease authority,
-        // which is a different role reached at a different address. Answering
-        // anyway would be worse than refusing: a crawler would believe it had
-        // permission nobody coordinated.
+        // A shard serves an index. Rate limits belong to a lease authority and
+        // ranking to a rank shard: different roles, different addresses.
+        // Answering anyway would be worse than refusing — a crawler would
+        // believe it had permission nobody coordinated, and a ranking run
+        // would believe it had a partition of the graph that is not here.
         Request::Lease { .. } => Response::Error {
             message: "a shard does not grant fetch leases".to_owned(),
+        },
+        Request::RankInit { .. }
+        | Request::RankDangling
+        | Request::RankEmit
+        | Request::RankAbsorb { .. }
+        | Request::RankApply { .. }
+        | Request::RankResults => Response::Error {
+            message: "a shard does not hold a partition of the link graph".to_owned(),
         },
     }
 }

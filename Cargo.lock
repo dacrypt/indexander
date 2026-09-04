@@ -597,6 +597,7 @@ dependencies = [
  "indexander-crawl",
  "indexander-index",
  "indexander-proto",
+ "indexander-rank",
  "tokio",
 ]
 

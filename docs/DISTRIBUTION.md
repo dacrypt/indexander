@@ -139,6 +139,22 @@ must own every node it holds *before* the first iteration, including pages with
 no outgoing links. A dangling page holds rank; a page nobody owns holds none,
 and the vector quietly stops summing to one.
 
+**Routing lives on the coordinator, not on the shards.** A shard emitting a
+contribution labels it "not mine" and the coordinator delivers it. Letting each
+shard route would mean every shard needs the same routing function *and the
+same shard count*, and a disagreement between two of them does not error: the
+contribution arrives somewhere that does not own the page and is dropped, and
+the ranking is quietly short of some rank. `ShardRanker::absorb` refuses to
+create a page it does not own rather than let two shards own it — but not
+creating the problem is better than detecting it.
+
+**The order of the three exchanges is the whole correctness argument.** Dangling
+mass has to be summed across every shard before anyone applies an iteration;
+every shard has to emit from the previous iteration's ranks before anyone
+absorbs this one's; the residual has to be summed before anyone stops. Get any
+of them out of order and the run still finishes, still produces numbers, and
+the numbers are wrong.
+
 ## 5. The storage layer
 
 Segments are immutable files. That makes the "distributed database" the easiest
@@ -168,13 +184,11 @@ storage layer be boring, and the storage layer should be boring.
    authority; `indexander crawl --leases <addr>` defers to it. The crawler
    asks a channel and cannot tell whether the answer came from this process or
    a socket, so a one-node crawl and a fifty-node crawl run the same code.
-4. **Partly done.** The algorithm and its three exchanges are in
-   `crates/rank/src/distributed.rs`, and `crates/rank/tests/distributed.rs`
-   asserts that splitting a graph across 2, 3, 5, 8 or 17 shards gives the same
-   ranks and the same *order* as computing it in one process. What is not done
-   is the transport: the exchanges are data structures, not messages on a
-   socket. That is the same shape as step 1 — the algorithm no longer assumes
-   one process, and wiring it is mechanical.
+4. ~~Distributed PageRank with boundary exchange.~~ **Done.** The algorithm is
+   in `crates/rank/src/distributed.rs` and the transport in
+   `crates/cluster/src/ranking.rs`. Splitting a graph across up to 17 shards
+   in process, or 5 over real sockets, gives the same ranks and the same
+   *order* as computing it in one.
 5. Replication and merge scheduling.
 
 Step 1 is most of the value: it is what stops the single-process assumption
