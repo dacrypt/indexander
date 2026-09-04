@@ -39,7 +39,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 18 µs to 63 µs over 7,661 documents, warm; the older 103k-document figures elsewhere in this file were measured under the intersection semantics that bare terms no longer have |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.258 MAP and 0.844 success@10 on Cranfield's human judgements; 0.557 MRR on known-item queries |
-| Tests | 381, including full crawls and eight-shard queries over real sockets |
+| Tests | 384, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -707,6 +707,50 @@ query scores with corpus-wide statistics, which is every sharded query and
 every index of more than one segment. Those now walk everything rather than
 prune on a number that does not hold.
 
+### Telling a replica to look
+
+A replica catches up when something asks it to. `indexander sync` does that
+from outside; a primary that has just merged can do it directly:
+
+```console
+$ indexander merge ./index --per-tier 2 --notify 127.0.0.1:7831,127.0.0.1:7832
+  2 segments -> 8ef6d0c8f65a974f.ixdr (6 documents, 1.2 KiB)
+  2 segments -> bd0783a0aa952ffe.ixdr (6 documents, 1.3 KiB)
+  2 segments -> 2ddb235770b38255.ixdr (12 documents, 2.2 KiB)
+  127.0.0.1:7831: 1 segment(s), 0 fetched
+  127.0.0.1:7832: 1 segment(s), 1 fetched
+3 merges folding 6 segments in 53.88ms
+```
+
+Two things in that output are worth reading closely.
+
+**The primary is in the list, and it is first.** A merge runs in its own
+process; the shard *serving* that directory opened its manifest at startup and
+knows nothing about it. Told in the other order, a replica syncs against a
+manifest that no longer describes the directory and comes away with nothing —
+which is how the test for this failed the first time it was run, before the
+ordering was understood.
+
+**The primary fetched nothing and the replica fetched one.** A shard with no
+source refreshes by rereading its own directory; one started with `--from`
+pulls first. The segment count is the only thing that changes visibly: a merge
+preserves documents by definition, so a replica still on the old segments
+answers every query identically to one that has caught up.
+
+`Request::Refresh` carries no address, no manifest and no segment. It is a
+nudge, not an instruction: a replica pulls from the one place it was started
+with, so the worst a stranger can do by sending one is ask for work it was
+going to do anyway. And losing one costs staleness until the next, which is why
+what actually guarantees convergence is the replica's own timer:
+
+```bash
+indexander sync ./replica --from 127.0.0.1:7801 --every 300
+```
+
+A refresh that fails changes nothing. Segments arrive before the manifest and
+the index is reopened only after both, so a replica whose source died mid-sync
+goes on serving exactly what it was serving.
+
 ## Query syntax
 
 ```text
@@ -757,9 +801,10 @@ runtime from scratch would be three different projects.
 
 Stated plainly, because a README that only lists what works is a sales page:
 
-- **Telling replicas to sync rather than having them ask.** A replica catches
-  up when `indexander sync` is run; there is no push from a primary that has
-  just merged.
+- **Sweeping orphans.** Segments a merge replaced are listed, never deleted.
+  Deciding a file is unreferenced is easy; deciding nobody is still reading it
+  is not — and a replica that has just synced is holding memory maps into the
+  files it replaced.
 - **Sweeping orphans.** They are listed, never deleted. Deciding a file is
   unreferenced is easy; deciding nobody is still reading it is not.
 - **Letting a shard prune.** The block bounds are computed when a segment is

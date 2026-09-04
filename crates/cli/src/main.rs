@@ -17,14 +17,14 @@ use std::time::Duration;
 
 use indexander_cluster::coordinator::Coordinator;
 use indexander_cluster::leases::LeaseAuthority;
-use indexander_cluster::shard::ShardIndex;
+use indexander_cluster::shard::{Replica, ShardIndex};
 use indexander_core::DocId;
 use indexander_core::Document;
 use indexander_crawl::Config;
 use indexander_crawl::politeness::Politeness;
 use indexander_crawl::robots_cache::RobotsCache;
 use indexander_index::builder::SegmentBuilder;
-use indexander_index::manifest::Policy as MergePolicy;
+use indexander_index::manifest::{Entry as ManifestEntry, Manifest, Policy as MergePolicy};
 use indexander_index::merger::Merger;
 use indexander_index::query;
 use indexander_index::scoring::Params;
@@ -43,10 +43,12 @@ USAGE:
                               [--delay <ms>] [--concurrency <n>] [--any-host]
                               [--k1 <n>] [--b <n>]
     indexander index <directory> [--out <segment>] [--k1 <n>] [--b <n>]
-    indexander shard  --listen <addr> [--index <segment>]
+    indexander shard  --listen <addr> [--index <segment>] [--from <addr>]
     indexander leases --listen <addr> [--floor <ms>]     rate limits + robots.txt
+    indexander manifest <directory>                       assemble an index
     indexander merge  <directory> [--per-tier <n>] [--once] [--every <secs>]
-    indexander sync   <directory> --from <addr>
+                                  [--notify <addr,addr,...>]
+    indexander sync   <directory> --from <addr> [--every <secs>]
     indexander search <query>... [--index <segment>] [--limit <n>]
                                  [--shards <addr,addr,...>]
     indexander stats [--index <segment>]
@@ -64,7 +66,9 @@ EXAMPLES:
     indexander search '\"inverted index\"' -perl --limit 5
     indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
     indexander leases --listen 127.0.0.1:7900 --floor 1000
-    indexander merge ./index --per-tier 8 --every 60
+    indexander manifest ./index
+    indexander merge ./index --per-tier 8 --every 60 --notify 127.0.0.1:7801
+    indexander sync ./replica --from 127.0.0.1:7801 --every 300
     indexander sync ./replica --from 127.0.0.1:7801
     indexander crawl https://example.com --leases 127.0.0.1:7900
     indexander search motor --shards 127.0.0.1:7801,127.0.0.1:7802
@@ -94,6 +98,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "crawl" => cmd_crawl(&args[1..]),
         "shard" => cmd_shard(&args[1..]),
         "leases" => cmd_leases(&args[1..]),
+        "manifest" => cmd_manifest(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
         "sync" => cmd_sync(&args[1..]),
         "index" => cmd_index(&args[1..]),
@@ -279,26 +284,36 @@ fn apply_pagerank(builder: &mut SegmentBuilder, graph_builder: GraphBuilder) -> 
 /// Serves one segment to a coordinator.
 fn cmd_shard(args: &[String]) -> Result<(), String> {
     let (listen, rest) = take_option(args, "--listen");
-    let (index, _) = take_option(&rest, "--index");
+    let (index, rest) = take_option(&rest, "--index");
+    let (from, _) = take_option(&rest, "--from");
     let listen = listen.ok_or_else(|| format!("shard needs --listen\n\n{USAGE}"))?;
     // A directory with a manifest, or a single segment file. A shard that
     // holds a whole index can serve its segments to a replica by name; one
     // holding a lone file can only serve itself.
     let path = std::path::PathBuf::from(index.as_deref().unwrap_or(DEFAULT_SEGMENT));
-    let shard = Arc::new(if path.is_dir() {
-        ShardIndex::open(&path).map_err(|e| format!("opening {}: {e}", path.display()))?
+    if from.is_some() && !path.is_dir() {
+        return Err("--from needs a directory to sync into, not a single segment".to_owned());
+    }
+    let replica = Arc::new(if path.is_dir() {
+        Replica::following(&path, from.clone())
+            .map_err(|e| format!("opening {}: {e}", path.display()))?
     } else {
-        ShardIndex::single(open_segment(index.as_deref())?)
+        Replica::fixed(ShardIndex::single(open_segment(index.as_deref())?))
     });
 
+    let shard = replica.shard();
     println!(
-        "shard listening on {listen}: {} documents in {} segment{}",
+        "shard listening on {listen}: {} documents in {} segment{}{}",
         shard.index().document_count(),
         shard.index().segment_count(),
         if shard.index().segment_count() == 1 {
             ""
         } else {
             "s"
+        },
+        match &from {
+            Some(source) => format!(", following {source}"),
+            None => String::new(),
         }
     );
 
@@ -307,7 +322,7 @@ fn cmd_shard(args: &[String]) -> Result<(), String> {
         let listener = tokio::net::TcpListener::bind(&listen)
             .await
             .map_err(|e| format!("binding {listen}: {e}"))?;
-        indexander_cluster::shard::serve(listener, shard)
+        indexander_cluster::shard::serve_replica(listener, replica)
             .await
             .map_err(|e| format!("serving: {e}"))
     })
@@ -340,7 +355,7 @@ fn search_cluster(addresses: &[String], query_text: &str, limit: usize) -> Resul
         for (rank, hit) in hits.iter().enumerate() {
             println!("{:>3}. {:>8.4}  {}", rank + 1, hit.score, hit.uri);
         }
-        let (documents, _) = coordinator.stats().await.map_err(|e| e.to_string())?;
+        let (documents, _, _) = coordinator.stats().await.map_err(|e| e.to_string())?;
         println!(
             "\n{} result{} in {:.2?} across {} shard{} ({documents} documents, connect {:.2?})",
             hits.len(),
@@ -455,9 +470,73 @@ fn cmd_leases(args: &[String]) -> Result<(), String> {
 /// manifest, and the manifest is the only thing that decides what an index is,
 /// so a merge killed halfway leaves a file nobody references rather than an
 /// index nobody can read.
+/// Writes a MANIFEST naming every segment in a directory.
+///
+/// The gap this closes: `index` writes one segment, and everything that treats
+/// an index as several - merging, replication, a shard serving its pieces by
+/// name - needs a manifest to say which they are and in what order. Without
+/// this the whole of that machinery was reachable only from a test.
+///
+/// Segments are taken in file name order, and that order is the index's: the
+/// documents of the first come before the documents of the second, and their
+/// ids are assigned that way when they merge. Renaming a segment therefore
+/// renumbers documents, which is why this refuses to guess and simply sorts.
+fn cmd_manifest(args: &[String]) -> Result<(), String> {
+    let directory = args
+        .first()
+        .ok_or_else(|| format!("manifest needs a directory\n\n{USAGE}"))?;
+    let directory = Path::new(directory);
+
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .map_err(|e| format!("{}: {e}", directory.display()))?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        // A case-insensitive match, because a directory copied through a
+        // filesystem that does not preserve case would otherwise look empty.
+        .filter(|n| {
+            std::path::Path::new(n)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ixdr"))
+        })
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(format!("{} holds no segments", directory.display()));
+    }
+
+    let mut manifest = Manifest::new();
+    for name in &names {
+        let path = directory.join(name);
+        let segment = Segment::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Every segment is opened rather than trusted: a manifest naming a
+        // file that will not parse is a directory that fails at query time
+        // instead of here.
+        manifest.segments.push(ManifestEntry {
+            name: name.clone(),
+            digest: segment.digest(),
+            documents: segment.document_count(),
+            bytes: std::fs::metadata(&path).map_or(0, |m| m.len()),
+        });
+        println!("  {name}  {} documents", segment.document_count());
+    }
+
+    let path = directory.join("MANIFEST");
+    manifest
+        .write_to(&path)
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    println!(
+        "{} segments, {} documents -> {}",
+        manifest.segments.len(),
+        manifest.segments.iter().map(|e| e.documents).sum::<usize>(),
+        path.display()
+    );
+    Ok(())
+}
+
 fn cmd_merge(args: &[String]) -> Result<(), String> {
     let (per_tier, rest) = take_option(args, "--per-tier");
     let (every, rest) = take_option(&rest, "--every");
+    let (notify, rest) = take_option(&rest, "--notify");
     let (once, rest): (Vec<String>, Vec<String>) = rest.into_iter().partition(|a| a == "--once");
     let directory = rest
         .first()
@@ -471,6 +550,13 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
     }
 
     let merger = Merger::new(Path::new(directory), policy);
+    let told: Vec<String> = notify
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // --every turns this into the background merger: the same step, on a
     // clock. Kept as a loop here rather than a daemon inside the library,
@@ -485,6 +571,7 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
             match merger.run_to_completion() {
                 Ok(reports) if !reports.is_empty() => {
                     println!("{} merge(s)", reports.len());
+                    announce(&told);
                 }
                 Ok(_) => {}
                 // A merge that failed leaves the index as it was, so the right
@@ -525,6 +612,9 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
             println!("    {stuck} could not be removed; it is unreferenced now");
         }
     }
+    // After the report, not before it: printed the other way round the output
+    // reads as though replicas were told about a merge that had not happened.
+    announce(&told);
     println!(
         "{} merge{} folding {folded} segments in {:.2?}",
         reports.len(),
@@ -557,14 +647,71 @@ fn report_orphans(merger: &Merger) -> Result<(), String> {
 }
 
 /// Brings a replica into line with the index served somewhere else.
+/// Tells each address to catch up, in the order given.
+///
+/// The order matters and the tool does not reorder it. A merge happens in this
+/// process; every shard *serving* that index opened its manifest at startup
+/// and knows nothing about it — including the one whose directory was just
+/// merged. So the primary comes first in the list, and the replicas after it:
+/// told the other way round, a replica syncs against a manifest that no longer
+/// describes the directory and comes away with nothing.
+///
+/// A nudge that fails is reported and not fatal. The primary has already
+/// merged, the index on disk is correct, and refusing to finish because one
+/// replica is down would only make an outage worse. What guarantees a replica
+/// converges is its own timer, not this.
+fn announce(addresses: &[String]) {
+    if addresses.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Runtime::new() else {
+        eprintln!("could not start a runtime to notify replicas");
+        return;
+    };
+    for address in addresses {
+        match runtime.block_on(indexander_cluster::replication::notify(address)) {
+            Ok((fetched, segments)) => {
+                println!("  {address}: {segments} segment(s), {fetched} fetched");
+            }
+            Err(e) => eprintln!("  {address}: not notified: {e}"),
+        }
+    }
+}
+
 fn cmd_sync(args: &[String]) -> Result<(), String> {
     let (from, rest) = take_option(args, "--from");
+    let (every, rest) = take_option(&rest, "--every");
     let directory = rest
         .first()
         .ok_or_else(|| format!("sync needs a directory\n\n{USAGE}"))?;
     let from = from.ok_or_else(|| format!("sync needs --from\n\n{USAGE}"))?;
 
     let runtime = tokio::runtime::Runtime::new().map_err(|e| format!("starting runtime: {e}"))?;
+
+    // The timer, not the notification, is what makes a replica converge. A
+    // nudge from the primary is a latency improvement; this is the guarantee.
+    if let Some(seconds) = every {
+        let interval: u64 = seconds
+            .parse()
+            .map_err(|_| "--every needs a number of seconds".to_owned())?;
+        println!("syncing {directory} from {from} every {interval}s; interrupt to stop");
+        loop {
+            match runtime.block_on(indexander_cluster::replication::sync_from(
+                &from,
+                Path::new(directory),
+            )) {
+                Ok(fetched) if !fetched.is_empty() => {
+                    println!("fetched {} segment(s)", fetched.len());
+                }
+                Ok(_) => {}
+                // A source that is down now may be up in a minute, and the
+                // replica keeps serving what it has meanwhile.
+                Err(e) => eprintln!("sync failed: {e}"),
+            }
+            std::thread::sleep(Duration::from_secs(interval.max(1)));
+        }
+    }
+
     let started = std::time::Instant::now();
     let fetched = runtime
         .block_on(indexander_cluster::replication::sync_from(

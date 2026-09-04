@@ -93,6 +93,18 @@ pub enum Request {
     ///
     /// Chunked because a segment is hundreds of megabytes and a frame is not.
     SegmentChunk { name: String, offset: u64, len: u32 },
+    /// Catch up with the source this replica was configured to follow, and
+    /// serve what it finds afterwards.
+    ///
+    /// Deliberately empty. It carries no address, no manifest and no segment:
+    /// it is a nudge, not an instruction. A replica pulls from the one place
+    /// it was started with, so the worst a stranger can do by sending this is
+    /// make it check for work it was going to do anyway.
+    ///
+    /// Losing one costs staleness until the next, which is why the primary
+    /// sending them is a convenience and `indexander sync --every` is the
+    /// thing that actually guarantees a replica converges.
+    Refresh,
     /// May I make `permits` requests to `host`?
     ///
     /// Sent to whichever node owns that host's rate limit, which is a
@@ -140,6 +152,14 @@ pub enum Response {
         documents: usize,
         terms: usize,
         average_length: f32,
+        /// How many segments this shard is serving right now.
+        ///
+        /// Not a curiosity: it is the only thing that changes visibly when a
+        /// replica catches up with a merge. Documents survive a merge by
+        /// definition, so a replica still on the old segments answers every
+        /// query identically to one that has caught up — and the count is what
+        /// tells them apart, from outside, without reading its disk.
+        segments: usize,
     },
     /// Permission granted, starting in `wait_ms` from now.
     Lease {
@@ -149,6 +169,13 @@ pub enum Response {
         spacing_ms: u64,
     },
     /// Answer to [`Request::Manifest`].
+    /// What a replica holds after catching up.
+    Refreshed {
+        /// Segments fetched from the source. Zero means it was already current.
+        fetched: usize,
+        segments: usize,
+        documents: usize,
+    },
     Manifest {
         text: String,
     },
@@ -215,6 +242,7 @@ const REQ_SEGMENT_INFO: u8 = 11;
 const REQ_SEGMENT_CHUNK: u8 = 12;
 const REQ_ROBOTS: u8 = 13;
 const REQ_MANIFEST: u8 = 14;
+const REQ_REFRESH: u8 = 15;
 
 const RES_TERM_STATS: u8 = 1;
 const RES_HITS: u8 = 2;
@@ -230,6 +258,7 @@ const RES_SEGMENT_INFO: u8 = 11;
 const RES_SEGMENT_CHUNK: u8 = 12;
 const RES_ROBOTS: u8 = 13;
 const RES_MANIFEST: u8 = 14;
+const RES_REFRESHED: u8 = 15;
 
 impl Request {
     #[must_use]
@@ -312,6 +341,7 @@ impl Request {
                 w.str(text);
             }
             Self::Manifest => w.u8(REQ_MANIFEST),
+            Self::Refresh => w.u8(REQ_REFRESH),
             Self::SegmentInfo { name } => {
                 w.u8(REQ_SEGMENT_INFO);
                 w.str(name);
@@ -390,6 +420,7 @@ impl Request {
                 text: r.string()?,
             },
             REQ_MANIFEST => Self::Manifest,
+            REQ_REFRESH => Self::Refresh,
             REQ_SEGMENT_INFO => Self::SegmentInfo { name: r.string()? },
             REQ_SEGMENT_CHUNK => Self::SegmentChunk {
                 name: r.string()?,
@@ -409,9 +440,9 @@ impl Request {
 }
 
 impl Response {
-    // One arm per variant, each a handful of lines. Splitting it would put the
-    // encoder and its decoder further apart, which is the pairing that has to
-    // stay readable together.
+    // One arm per variant, each a handful of lines, for both of these.
+    // Splitting either would put the encoder and its decoder further apart,
+    // and that pairing is what has to stay readable together.
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -446,11 +477,13 @@ impl Response {
                 documents,
                 terms,
                 average_length,
+                segments,
             } => {
                 w.u8(RES_STATS);
                 w.usize(*documents);
                 w.usize(*terms);
                 w.f32(*average_length);
+                w.usize(*segments);
             }
             Self::Lease {
                 wait_ms,
@@ -494,6 +527,16 @@ impl Response {
                 w.u8(RES_MANIFEST);
                 w.str(text);
             }
+            Self::Refreshed {
+                fetched,
+                segments,
+                documents,
+            } => {
+                w.u8(RES_REFRESHED);
+                w.usize(*fetched);
+                w.usize(*segments);
+                w.usize(*documents);
+            }
             Self::Robots { state, text } => {
                 w.u8(RES_ROBOTS);
                 w.u8(*state);
@@ -518,6 +561,7 @@ impl Response {
         w.finish()
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let message = match r.u8()? {
@@ -553,6 +597,7 @@ impl Response {
                 documents: r.usize()?,
                 terms: r.usize()?,
                 average_length: r.f32()?,
+                segments: r.usize()?,
             },
             RES_LEASE => Self::Lease {
                 wait_ms: r.varint()?,
@@ -588,6 +633,11 @@ impl Response {
                 Self::RankResults { ranks }
             }
             RES_MANIFEST => Self::Manifest { text: r.string()? },
+            RES_REFRESHED => Self::Refreshed {
+                fetched: r.usize()?,
+                segments: r.usize()?,
+                documents: r.usize()?,
+            },
             RES_ROBOTS => Self::Robots {
                 state: r.u8()?,
                 text: r.string()?,
@@ -676,6 +726,7 @@ mod tests {
         roundtrip_request(&Request::RankAbsorb {
             contributions: Vec::new(),
         });
+        roundtrip_request(&Request::Refresh);
         roundtrip_request(&Request::TermStats { terms: Vec::new() });
         roundtrip_request(&Request::TermStats {
             terms: vec!["motor".into(), "búsqueda".into()],
@@ -692,6 +743,11 @@ mod tests {
     #[test]
     fn every_response_roundtrips() {
         for response in [
+            Response::Refreshed {
+                fetched: 2,
+                segments: 3,
+                documents: 4000,
+            },
             Response::TermStats {
                 doc_count: 500,
                 total_length: 4_400_000,
@@ -708,6 +764,7 @@ mod tests {
                 documents: 10,
                 terms: 20,
                 average_length: 33.5,
+                segments: 3,
             },
             Response::Lease {
                 wait_ms: 1500,

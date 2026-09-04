@@ -314,24 +314,27 @@ impl Coordinator {
         Ok(out)
     }
 
-    /// Totals across the cluster.
-    pub async fn stats(&self) -> Result<(usize, usize)> {
+    /// Totals across the cluster: documents, terms, segments.
+    pub async fn stats(&self) -> Result<(usize, usize, usize)> {
         let mut documents = 0;
         let mut terms = 0;
+        let mut segments = 0;
         for (_, response) in self.broadcast(&Request::Stats).await? {
             if let Response::Stats {
                 documents: d,
                 terms: t,
+                segments: g,
                 ..
             } = response
             {
+                segments += g;
                 documents += d;
                 // Term counts overlap between shards, so this is an upper
                 // bound on distinct terms, not the number of them.
                 terms += t;
             }
         }
-        Ok((documents, terms))
+        Ok((documents, terms, segments))
     }
 }
 

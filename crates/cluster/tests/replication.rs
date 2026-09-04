@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use indexander_cluster::coordinator::Coordinator;
 use indexander_cluster::replication::fetch_segment;
-use indexander_cluster::shard::{self, ShardIndex};
+use indexander_cluster::shard::{self, Replica, ShardIndex};
 use indexander_core::Document;
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::query;
@@ -207,7 +207,7 @@ async fn an_empty_replica_list_is_refused() {
 
 // --- syncing a whole index -----------------------------------------------
 
-use indexander_cluster::replication::sync_from;
+use indexander_cluster::replication::{notify, sync_from};
 use indexander_index::manifest::{Entry, Manifest, Policy};
 use indexander_index::merger::Merger;
 
@@ -343,4 +343,150 @@ async fn a_sync_that_cannot_reach_the_source_installs_nothing() {
         "a failed sync installed a manifest"
     );
     std::fs::remove_dir_all(&replica).ok();
+}
+
+/// Serves a directory as a replica that follows `upstream` and can be told to
+/// catch up. The returned handle kills the server.
+async fn serve_following(
+    dir: &std::path::Path,
+    upstream: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    let replica = Arc::new(Replica::following(dir, upstream).expect("open"));
+    let handle = tokio::spawn(async move {
+        let _ = shard::serve_replica(listener, replica).await;
+    });
+    (address, handle)
+}
+
+/// A replica that has been told to look picks up a merge without restarting.
+///
+/// The property replication is missing without this: a primary can merge all
+/// it likes, and every copy of the index goes on answering from the segments
+/// it opened at startup until somebody kills it.
+///
+/// Including the primary. A merge runs in its own process and the shard
+/// serving that directory has no idea it happened — so the order is: merge,
+/// tell the primary, then tell the replicas. Told in the other order, a
+/// replica syncs against a manifest that no longer describes the directory and
+/// comes away with nothing.
+#[tokio::test]
+async fn a_notified_replica_serves_the_merged_index_without_restarting() {
+    let source = scratch("notify-source");
+    let mirror = scratch("notify-replica");
+    build_index(&source, 8);
+
+    let (primary, primary_task) = serve_directory(&source).await;
+    // The replica starts empty and catches up once, the ordinary way.
+    sync_from(&primary, &mirror).await.expect("first sync");
+    let (replica, replica_task) = serve_following(&mirror, Some(primary.clone())).await;
+
+    let before = ask_stats(&replica).await;
+    assert_eq!(before.1, 8, "the replica should be serving eight segments");
+
+    // The primary folds eight segments into one.
+    let merger = Merger::new(
+        &source,
+        indexander_index::manifest::Policy {
+            segments_per_tier: 2,
+            ..indexander_index::manifest::Policy::default()
+        },
+    );
+    merger.run_to_completion().expect("merge");
+    let folded = ShardIndex::open(&source).expect("reopen source");
+    assert!(
+        folded.index().segment_count() < 8,
+        "the merge did nothing: {}",
+        folded.index().segment_count()
+    );
+
+    // Without a nudge the replica is still on the old segments.
+    let stale = ask_stats(&replica).await;
+    assert_eq!(stale, before, "the replica changed without being told");
+
+    // So is the primary. It opened its index at startup and has been serving
+    // that manifest ever since; the merge happened in another process and the
+    // server knows nothing about it. Notifying the replica first would have it
+    // sync against a manifest that no longer describes the directory, and
+    // fetch nothing.
+    assert_eq!(
+        ask_stats(&primary).await.1,
+        8,
+        "the primary should still be advertising the pre-merge manifest"
+    );
+    notify(&primary)
+        .await
+        .expect("the primary rereads its own directory");
+    assert_eq!(ask_stats(&primary).await.1, folded.index().segment_count());
+
+    let (fetched, segments) = notify(&replica).await.expect("notify");
+    assert!(fetched > 0, "the replica fetched nothing from the merge");
+    assert_eq!(segments, folded.index().segment_count());
+
+    let after = ask_stats(&replica).await;
+    assert_eq!(
+        after.0, before.0,
+        "documents must survive a merge: {before:?} -> {after:?}"
+    );
+    assert_eq!(after.1, folded.index().segment_count());
+
+    primary_task.abort();
+    replica_task.abort();
+    std::fs::remove_dir_all(&source).ok();
+    std::fs::remove_dir_all(&mirror).ok();
+}
+
+/// A replica told to refresh when its source is gone keeps serving.
+#[tokio::test]
+async fn a_refresh_that_cannot_reach_the_source_changes_nothing() {
+    let source = scratch("notify-dead-source");
+    let mirror = scratch("notify-dead-replica");
+    build_index(&source, 4);
+
+    let (primary, primary_task) = serve_directory(&source).await;
+    sync_from(&primary, &mirror).await.expect("sync");
+    let (replica, replica_task) = serve_following(&mirror, Some(primary.clone())).await;
+    let before = ask_stats(&replica).await;
+
+    primary_task.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let err = notify(&replica).await.expect_err("the source is gone");
+    assert!(
+        err.to_string().contains("refresh failed"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        ask_stats(&replica).await,
+        before,
+        "a failed refresh must leave the replica where it was"
+    );
+
+    replica_task.abort();
+    std::fs::remove_dir_all(&source).ok();
+    std::fs::remove_dir_all(&mirror).ok();
+}
+
+/// An in-memory shard says so rather than pretending to refresh.
+#[tokio::test]
+async fn a_shard_with_no_directory_refuses_to_refresh() {
+    let (address, task) = serve(Segment::from_bytes(built().encode()).expect("segment")).await;
+    let err = notify(&address)
+        .await
+        .expect_err("nothing on disk to reread");
+    assert!(
+        err.to_string().contains("in memory"),
+        "unexpected error: {err}"
+    );
+    task.abort();
+}
+
+/// Documents and segment count, straight from a running shard.
+async fn ask_stats(address: &str) -> (usize, usize) {
+    let coordinator = Coordinator::connect(&[address.to_owned()])
+        .await
+        .expect("connect");
+    let (documents, _, segments) = coordinator.stats().await.expect("stats");
+    (documents, segments)
 }

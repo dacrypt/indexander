@@ -131,7 +131,8 @@ async fn the_cluster_reports_its_totals() {
     let a = start(&shard_a()).await;
     let b = start(&shard_b()).await;
     let coordinator = Coordinator::connect(&[a, b]).await.expect("connect");
-    let (documents, terms) = coordinator.stats().await.expect("stats");
+    let (documents, terms, segments) = coordinator.stats().await.expect("stats");
+    assert_eq!(segments, 2, "one segment per shard");
     assert_eq!(documents, 110);
     assert!(terms > 0);
 }

@@ -7,9 +7,9 @@
 //! the same program.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use indexander_core::Result;
+use indexander_core::{Error, Result};
 use indexander_index::index::Index;
 use indexander_index::manifest::Manifest;
 use indexander_index::query;
@@ -70,6 +70,12 @@ impl ShardIndex {
         &self.manifest
     }
 
+    /// Where this shard's segments live, if they live anywhere.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+
     /// The bytes of a named segment, for a replica copying it.
     ///
     /// An empty name means the only segment this shard holds, which is what a
@@ -106,6 +112,139 @@ impl ShardIndex {
 /// tested without a socket, and the socket code has nothing left to get wrong
 /// but framing.
 #[must_use]
+/// A shard that can be told to catch up without being restarted.
+///
+/// The index it serves is behind a lock that readers hold for exactly as long
+/// as it takes to clone an `Arc`. Every query then works on its own handle,
+/// outside the lock, so a refresh swapping in a new index cannot stall a
+/// search, and a search already running keeps the segments it started with
+/// until it finishes — which matters, because those segments are memory-mapped
+/// files that a later merge will eventually delete.
+///
+/// A replica follows one address, given when it starts. [`Request::Refresh`]
+/// carries no address of its own, so nothing arriving over the network can
+/// point a replica somewhere else; the worst a stranger can do by sending one
+/// is ask for work the replica was configured to do anyway.
+#[derive(Debug)]
+pub struct Replica {
+    current: RwLock<Arc<ShardIndex>>,
+    /// Where the segments live. `None` for an in-memory shard, which cannot
+    /// refresh because there is nothing on disk to reread.
+    directory: Option<PathBuf>,
+    /// The source to pull from. `None` still refreshes, by rereading the
+    /// directory — which is what a primary does after it merges its own index.
+    upstream: Option<String>,
+}
+
+/// What a refresh left the replica holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refreshed {
+    /// Segments copied from the source. Zero means it was already current.
+    pub fetched: usize,
+    pub segments: usize,
+    pub documents: usize,
+}
+
+impl Replica {
+    /// A shard that serves one thing forever.
+    ///
+    /// Refreshing it is an error rather than a quiet no-op: something asked
+    /// for a guarantee this cannot give.
+    pub fn fixed(shard: ShardIndex) -> Self {
+        Self::fixed_arc(Arc::new(shard))
+    }
+
+    /// As [`Self::fixed`], for a shard already behind an `Arc`.
+    pub fn fixed_arc(shard: Arc<ShardIndex>) -> Self {
+        let directory = shard.directory().map(Path::to_path_buf);
+        Self {
+            current: RwLock::new(shard),
+            directory,
+            upstream: None,
+        }
+    }
+
+    /// A shard serving `directory`, catching up from `upstream` when told to.
+    ///
+    /// # Errors
+    ///
+    /// If the directory has no readable manifest, or a segment it names will
+    /// not open.
+    pub fn following(directory: &Path, upstream: Option<String>) -> Result<Self> {
+        Ok(Self {
+            current: RwLock::new(Arc::new(ShardIndex::open(directory)?)),
+            directory: Some(directory.to_path_buf()),
+            upstream,
+        })
+    }
+
+    /// The index to answer one request with.
+    ///
+    /// Cheap on purpose: an `Arc` clone under a read lock. Holding that lock
+    /// for the length of a query would let one refresh block every search.
+    ///
+    /// # Panics
+    ///
+    /// If a previous holder panicked while swapping the index, poisoning the
+    /// lock. A shard that cannot say what it serves is not something to paper
+    /// over.
+    #[must_use]
+    pub fn shard(&self) -> Arc<ShardIndex> {
+        Arc::clone(&self.current.read().expect("shard lock poisoned"))
+    }
+
+    #[must_use]
+    pub fn upstream(&self) -> Option<&str> {
+        self.upstream.as_deref()
+    }
+
+    /// Pulls from the source if there is one, then serves what is on disk.
+    ///
+    /// The order is the whole point. Segments arrive first and the manifest
+    /// last — that is [`crate::replication::sync_from`]'s rule — and only then
+    /// is the index reopened. A refresh that fails partway through leaves the
+    /// replica serving exactly what it was serving.
+    ///
+    /// # Errors
+    ///
+    /// If the shard holds its index in memory, if the source cannot be
+    /// reached, or if what arrived will not open. In each case the running
+    /// index is left alone.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned, as in [`Self::shard`].
+    pub async fn refresh(&self) -> Result<Refreshed> {
+        let Some(directory) = self.directory.clone() else {
+            return Err(Error::Corrupt(
+                "this shard holds its index in memory and has nothing to reread".into(),
+            ));
+        };
+        let fetched = match &self.upstream {
+            Some(address) => crate::replication::sync_from(address, &directory)
+                .await?
+                .len(),
+            None => 0,
+        };
+        // Opened before the swap, so a directory that will not open leaves the
+        // running index untouched.
+        let fresh = Arc::new(ShardIndex::open(&directory)?);
+        let refreshed = Refreshed {
+            fetched,
+            segments: fresh.index().segment_count(),
+            documents: fresh.index().document_count(),
+        };
+        *self.current.write().expect("shard lock poisoned") = fresh;
+        Ok(refreshed)
+    }
+}
+
+/// Answers everything that needs no I/O of its own.
+///
+/// [`Request::Refresh`] is not here: it reaches over the network to a source
+/// and then reopens files, so it is answered in [`connection`], where waiting
+/// is allowed. Keeping the rest synchronous means a query never touches an
+/// await point between reading the index and writing the answer.
 pub fn handle(shard: &ShardIndex, request: &Request) -> Response {
     match request {
         // Serving a copy of the index is a different job from answering
@@ -114,6 +253,11 @@ pub fn handle(shard: &ShardIndex, request: &Request) -> Response {
         Request::Manifest | Request::SegmentInfo { .. } | Request::SegmentChunk { .. } => {
             serve_bytes(shard, request)
         }
+        // Answered by `connection`, which is allowed to wait; see the note
+        // above. Reaching here means something called `handle` directly.
+        Request::Refresh => Response::Error {
+            message: "refresh is answered by the connection loop, not here".into(),
+        },
         Request::TermStats { terms } => {
             let doc_freq = terms
                 .iter()
@@ -185,6 +329,7 @@ pub fn handle(shard: &ShardIndex, request: &Request) -> Response {
             }
         }
         Request::Stats => Response::Stats {
+            segments: shard.index.segment_count(),
             documents: shard.index.document_count(),
             terms: shard.index.segments().iter().map(Segment::term_count).sum(),
             average_length: shard
@@ -252,18 +397,23 @@ fn serve_bytes(shard: &ShardIndex, request: &Request) -> Response {
 
 /// Serves `shard` on `listener` until the task is dropped.
 pub async fn serve(listener: TcpListener, shard: Arc<ShardIndex>) -> Result<()> {
+    serve_replica(listener, Arc::new(Replica::fixed_arc(shard))).await
+}
+
+/// Serves a replica, which is a shard that can be told to catch up.
+pub async fn serve_replica(listener: TcpListener, replica: Arc<Replica>) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
-        let shard = Arc::clone(&shard);
+        let replica = Arc::clone(&replica);
         // One task per connection. A slow or hostile client cannot block the
         // others, and a panic in one connection cannot take down the shard.
         tokio::spawn(async move {
-            let _ = connection(stream, &shard).await;
+            let _ = connection(stream, &replica).await;
         });
     }
 }
 
-async fn connection(mut stream: TcpStream, shard: &ShardIndex) -> Result<()> {
+async fn connection(mut stream: TcpStream, replica: &Replica) -> Result<()> {
     write_hello(&mut stream, PROTOCOL_VERSION).await?;
     read_hello(&mut stream, PROTOCOL_VERSION).await?;
 
@@ -276,7 +426,20 @@ async fn connection(mut stream: TcpStream, shard: &ShardIndex) -> Result<()> {
             return Ok(());
         };
         let response = match Request::decode(&payload) {
-            Ok(request) => handle(shard, &request),
+            // The one request that needs to wait: it pulls from the source and
+            // reopens files. Everything else is answered from the index this
+            // connection already holds.
+            Ok(Request::Refresh) => match replica.refresh().await {
+                Ok(r) => Response::Refreshed {
+                    fetched: r.fetched,
+                    segments: r.segments,
+                    documents: r.documents,
+                },
+                Err(e) => Response::Error {
+                    message: format!("refresh failed, still serving what it had: {e}"),
+                },
+            },
+            Ok(request) => handle(&replica.shard(), &request),
             Err(e) => Response::Error {
                 message: format!("undecodable request: {e}"),
             },

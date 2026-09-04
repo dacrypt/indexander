@@ -138,6 +138,33 @@ pub async fn fetch_named(address: &str, name: &str, destination: &Path) -> Resul
 /// Returns the names it fetched. Segments already present with the right
 /// digest are not refetched, which is what makes syncing after a merge cost
 /// the merged segment rather than the whole index.
+/// Tells a replica to catch up, and waits to hear what it ended up with.
+///
+/// A hint, not a transfer: the replica pulls from the source it was started
+/// with, and this carries nothing it could be redirected by. Losing one costs
+/// staleness until the next, which is why a replica should also be on a timer
+/// — `indexander sync --every` — rather than trusting that every nudge lands.
+///
+/// # Errors
+///
+/// If the replica cannot be reached, speaks a different protocol version, or
+/// reports that its own refresh failed.
+pub async fn notify(address: &str) -> Result<(usize, usize)> {
+    let mut stream = TcpStream::connect(address).await?;
+    let _ = stream.set_nodelay(true);
+    read_hello(&mut stream, PROTOCOL_VERSION).await?;
+    write_hello(&mut stream, PROTOCOL_VERSION).await?;
+    match call(&mut stream, &Request::Refresh).await? {
+        Response::Refreshed {
+            fetched, segments, ..
+        } => Ok((fetched, segments)),
+        Response::Error { message } => Err(Error::Corrupt(format!("{address}: {message}"))),
+        other => Err(Error::Corrupt(format!(
+            "{address} answered {other:?} to a refresh"
+        ))),
+    }
+}
+
 pub async fn sync_from(address: &str, directory: &Path) -> Result<Vec<String>> {
     let mut stream = TcpStream::connect(address).await?;
     let _ = stream.set_nodelay(true);
