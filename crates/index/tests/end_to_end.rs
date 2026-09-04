@@ -348,3 +348,101 @@ fn a_version_1_segment_is_refused_rather_than_misread() {
     let err = Segment::from_bytes(bytes).unwrap_err();
     assert!(format!("{err}").contains("version"), "got {err}");
 }
+
+// --- memory mapping ------------------------------------------------------
+
+/// A mapped segment must answer exactly like an in-memory one.
+#[test]
+fn a_mapped_segment_answers_like_an_owned_one() {
+    let mut builder = Builder::new();
+    for doc in &corpus() {
+        builder.add(doc);
+    }
+    let dir = std::env::temp_dir().join(format!("indexander-mmap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("segment.ixdr");
+    builder.write_to(&path).unwrap();
+
+    let owned = Segment::from_bytes(builder.encode()).unwrap();
+    let mapped = Segment::open(&path).unwrap();
+
+    assert_eq!(mapped.document_count(), owned.document_count());
+    assert_eq!(mapped.term_count(), owned.term_count());
+    for q in [
+        "indexander",
+        "busqueda",
+        r#""motor de busqueda""#,
+        "perl -rust",
+    ] {
+        let parsed = query::parse(q);
+        assert_eq!(
+            search(&mapped, &parsed, 10).unwrap(),
+            search(&owned, &parsed, 10).unwrap(),
+            "mapped and owned disagreed on {q:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Writing a segment must replace it atomically, never truncate in place.
+///
+/// This is what makes mapping sound: truncating a file another process has
+/// mapped is undefined behaviour, so `write_to` renames a new file over the
+/// old one instead. The old inode survives for whoever still holds it.
+#[test]
+fn rewriting_a_segment_does_not_disturb_an_open_one() {
+    let dir = std::env::temp_dir().join(format!("indexander-atomic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("segment.ixdr");
+
+    let mut first = Builder::new();
+    first.add(&Document::new("doc://one", "uno", "el primer indice"));
+    first.write_to(&path).unwrap();
+
+    // Map it, then replace the file underneath.
+    let mapped = Segment::open(&path).unwrap();
+    let mut second = Builder::new();
+    for i in 0..50 {
+        second.add(&Document::new(
+            format!("doc://{i}"),
+            "otro",
+            "un indice distinto y mas grande",
+        ));
+    }
+    second.write_to(&path).unwrap();
+
+    // The open segment still sees what it opened.
+    assert_eq!(mapped.document_count(), 1);
+    assert_eq!(mapped.doc(DocId(0)).unwrap().uri, "doc://one");
+    assert_eq!(
+        search(&mapped, &query::parse("primer"), 5).unwrap().len(),
+        1
+    );
+
+    // And a fresh open sees the new one.
+    let reopened = Segment::open(&path).unwrap();
+    assert_eq!(reopened.document_count(), 50);
+
+    // No temporary file left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn opening_a_missing_or_corrupt_file_errors() {
+    assert!(Segment::open(std::path::Path::new("/nonexistent/segment.ixdr")).is_err());
+
+    let dir = std::env::temp_dir().join(format!("indexander-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("garbage.ixdr");
+    std::fs::write(&path, b"not a segment at all").unwrap();
+    assert!(Segment::open(&path).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}

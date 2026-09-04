@@ -37,7 +37,8 @@ language and the ranking are real and tested end to end.
 | Query latency | 24 µs to 1.5 ms over 103,257 documents, by term frequency; 350 µs for a phrase |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Tests | 187, including full crawls and eight-shard queries over real sockets |
-| `unsafe` | none |
+| Memory | 32 MB resident to serve a 236 MB index |
+| `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
 
 Those numbers come from `indexander index` and `indexander search` on the
@@ -220,6 +221,27 @@ body 1×. Anchor text is the idea that a page is often better described by how
 others link to it than by what it says about itself — the `anchor_queue` of the
 original design, still here.
 
+**Segments are memory mapped, not read.** A shard serving a 236 MB index holds
+**32 MB** resident, not 269 MB, and answers its first query in 0.01 s instead of
+0.04 s — 0.35 s instead of 0.76 s when the file is cold. Pages arrive as they
+are touched, and a query touches a term dictionary entry and one postings list,
+not the whole index.
+
+The 32 MB that remain are the document store: every document's URI, field
+lengths and rank, parsed up front because scoring needs them for whatever
+document a query lands on. Keeping that on disk too is the next thing to do
+here.
+
+This is the one `unsafe` block in the engine, and it comes with an obligation.
+`Mmap::map` is unsafe because the mapping reflects the file: if anyone rewrites
+it, the bytes behind a live `&[u8]` change underneath. `File::create` on an
+existing path *truncates* it — so `write_to` now writes to a temporary file and
+renames it into place. Renaming replaces the directory entry and leaves the old
+inode alone, so a shard that has a segment mapped keeps a valid mapping until it
+lets go, and a reader never sees a half-written file either.
+`rewriting_a_segment_does_not_disturb_an_open_one` maps a segment, replaces the
+file underneath it, and asserts both of those.
+
 **Positions are decoded only when something needs them.** Positions are the
 bulk of an index — a common term has one document gap and dozens of positions
 behind it — and only a phrase query ever reads them. Skipping them for every
@@ -295,9 +317,10 @@ crates/cluster the coordinator and shard roles, over TCP
 crates/cli     the `indexander` binary
 ```
 
-`core` and `index` deliberately depend on nothing but the standard library. The
-crawler is where the dependencies live, because writing an HTTP client and a
-TLS stack from scratch would be a different project.
+`core`, `rank` and `proto` depend on nothing but the standard library. `index`
+depends on `memmap2` and nothing else. The crawler and the cluster are where
+the dependencies live, because writing an HTTP client, a TLS stack and an async
+runtime from scratch would be three different projects.
 
 ## What is not built yet
 
@@ -309,9 +332,6 @@ Stated plainly, because a README that only lists what works is a sales page:
   to 5 of `docs/DISTRIBUTION.md`.
 - **Segment merging.** One segment per index today. Real corpora need many,
   written incrementally and merged in the background.
-- **Memory mapping.** Segments are read into memory: a 236 MiB index is 236 MiB
-  of RSS and a read before a shard can answer anything. `mmap` avoids both, and
-  is now the largest remaining win.
 - **Skipping within a postings list.** A query still walks every posting of
   every term. Block-max indexes let a scorer prove a whole block cannot reach
   the current top-k and jump it.

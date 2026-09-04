@@ -24,9 +24,14 @@
 //! nothing. Terms are UTF-8 and compared as bytes, which for folded lowercase
 //! terms is the same order as comparing them as strings.
 //!
-//! The whole segment is read into memory. Memory mapping would avoid the copy
-//! and is the natural next step, but it needs `unsafe` and the copy is not yet
-//! what makes anything slow.
+//! A segment is memory mapped, not read. The difference is not the copy — it
+//! is that a shard holding a 236 MiB index no longer holds 236 MiB of resident
+//! memory, and no longer waits to read all of it before answering anything.
+//! Pages arrive as they are touched, and a query touches a term dictionary
+//! entry and one postings list.
+//!
+//! [`Segment::from_bytes`] still exists for indexes built in memory, and both
+//! paths are the same code behind a slice.
 
 use std::path::Path;
 
@@ -107,10 +112,33 @@ impl DocMeta {
     }
 }
 
+/// Where a segment's bytes live.
+///
+/// Both arms hand out a `&[u8]`, so nothing downstream knows or cares which
+/// one it got.
+#[derive(Debug)]
+enum Backing {
+    /// Built in memory, or read from a file that could not be mapped.
+    Owned(Vec<u8>),
+    /// Mapped from a file. The `Mmap` owns the mapping and unmaps on drop.
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(map) => map,
+        }
+    }
+}
+
 /// An immutable, searchable segment.
 #[derive(Debug)]
 pub struct Segment {
-    bytes: Vec<u8>,
+    bytes: Backing,
     postings_offset: usize,
     term_dict_offset: usize,
     term_offsets_offset: usize,
@@ -120,7 +148,7 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Parses a segment from raw bytes, validating the footer.
+    /// Parses a segment from bytes already in memory.
     ///
     /// # Panics
     ///
@@ -128,6 +156,41 @@ impl Segment {
     /// and the fixed-width reads inside that slice cannot fail. The
     /// `expect`s below document that invariant rather than relying on it.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::from_backing(Backing::Owned(bytes))
+    }
+
+    /// Opens a segment by memory mapping it.
+    ///
+    /// Falls back to reading the file when it cannot be mapped — an empty
+    /// file, a filesystem that does not support it — because a slower segment
+    /// is better than no segment.
+    ///
+    /// # Safety
+    ///
+    /// `Mmap::map` is unsafe because the mapping reflects the file: if another
+    /// process truncates or rewrites it, the bytes behind a live `&[u8]`
+    /// change, which is undefined behaviour. This engine never does that.
+    /// Segments are written once and never modified, and
+    /// [`SegmentBuilder::write_to`](crate::builder::SegmentBuilder::write_to)
+    /// writes to a temporary file and renames it into place, so replacing a
+    /// segment creates a new inode and leaves any existing mapping pointing at
+    /// the old one until its reader drops it.
+    ///
+    /// What remains outside that guarantee is somebody editing a segment file
+    /// by hand while a shard is serving it. That is the documented contract:
+    /// segment files are immutable while a process holds them.
+    #[allow(unsafe_code)]
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: see the contract above - segments are never modified in
+        // place, and writes go through a rename.
+        match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(map) => Self::from_backing(Backing::Mapped(map)),
+            Err(_) => Self::from_bytes(std::fs::read(path)?),
+        }
+    }
+
+    fn from_backing(bytes: Backing) -> Result<Self> {
         if bytes.len() < FOOTER_LEN {
             return Err(Error::Corrupt("file shorter than a footer".into()));
         }
@@ -184,10 +247,6 @@ impl Segment {
             docs,
             average_length,
         })
-    }
-
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::from_bytes(std::fs::read(path)?)
     }
 
     fn read_doc_store(bytes: &[u8], offset: usize, expected: usize) -> Result<Vec<DocMeta>> {

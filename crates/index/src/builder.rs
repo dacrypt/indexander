@@ -271,9 +271,25 @@ impl SegmentBuilder {
     /// Writes the segment to `path`, replacing whatever was there.
     pub fn write_to(&self, path: &Path) -> Result<()> {
         let bytes = self.encode();
-        let mut file = std::fs::File::create(path)?;
+
+        // Written to a sibling and renamed, never in place.
+        //
+        // Two reasons, and the second is not optional. First, a reader never
+        // sees a half-written segment: rename is atomic, so the file at `path`
+        // is either the old segment or the new one. Second, and this is what
+        // makes memory mapping sound: `File::create` on an existing path
+        // *truncates* it, and truncating a file that another process has
+        // mapped pulls the memory out from under it — the exact undefined
+        // behaviour `Segment::open`'s safety comment says cannot happen.
+        // Renaming replaces the directory entry and leaves the old inode
+        // alone, so a reader that already mapped it keeps a valid mapping
+        // until it lets go.
+        let temporary = path.with_extension("ixdr.tmp");
+        let mut file = std::fs::File::create(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
         Ok(())
     }
 }

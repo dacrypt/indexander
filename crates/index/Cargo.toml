@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 indexander-core.workspace = true
+memmap2 = "0.9.11"
 
 [lints]
 workspace = true
