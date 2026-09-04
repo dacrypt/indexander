@@ -113,6 +113,100 @@ lifted from a body is answered from the body, and weighting titles higher
 cannot help a document win a contest its title never entered. It is a limit of
 the *measurement*, and it is the reason `--from title` exists at all.
 
+
+## When the question has no single right answer
+
+A known-item query assumes the document its words came from is the only
+document that could be the answer. Point it at a directory holding forty git
+worktrees of one repository and that assumption is false forty times over: the
+answer is one of forty byte-identical copies, ranking among them is arbitrary,
+and MRR lands near `H(40)/40` — about 0.11.
+
+That is a small number that looks exactly like a bad ranker. It was measured
+here before it was understood, which is the only reason the check below exists.
+
+`known-item` now counts how many answers scored *exactly* the same as other
+documents, and says so:
+
+```console
+131 of them had the answer scoring exactly like 44.8 other documents on average, up to 99
+the corpus contains duplicates: these numbers describe how many copies of a
+document exist, not how well the engine ranks. Deduplicate it, or do not read
+the figures above.
+```
+
+The comparison is exact rather than approximate, which would be wrong almost
+anywhere else involving floats and is right here: copies produce bit-identical
+scores, and any margin of error would start folding merely similar documents
+into the same group. Near-duplicates that differ by a word will not be caught,
+and should not be — they are different documents.
+
+On the crate sources the warning stays quiet, but the count still appears: 13
+of 194 answers tie, which are the identical `LICENSE` files and empty `mod.rs`
+stubs. A corpus with none at all would be the surprising one.
+
+## Tuning: what the parameters are actually worth
+
+BM25 has two knobs. `K1` controls how quickly repeated occurrences of a term
+stop adding score; `B` controls how much a long document is penalised for
+being long. The shipped values are the textbook ones, 1.2 and 0.75.
+
+Twenty combinations, five seeds each, paired:
+
+**`K1` does not matter.** At `B = 1.0`, the four values 0.9, 1.2, 1.5 and 2.0
+give MRR 0.6432, 0.6438, 0.6438 and 0.6432 — a spread of 0.0006, thirty times
+smaller than the seed-to-seed noise.
+
+**`B` is the whole game.** At `K1 = 1.2`:
+
+| B | 0.30 | 0.50 | 0.75 | 0.90 | **1.00** | 1.10 | 1.25 | 1.50 | 2.00 |
+|---|---|---|---|---|---|---|---|---|---|
+| MRR | 0.447 | 0.490 | 0.557 | 0.601 | **0.644** | 0.621 | 0.598 | 0.574 | 0.472 |
+
+Full length normalisation beats the textbook 0.75 by 0.087 MRR here, four
+times the noise.
+
+That result needed one more test before it could be believed. `B` penalises
+long documents, and known-item queries are easier to answer when the target is
+short — so a number that simply kept climbing with `B` would be measuring
+document length, not ranking. It does not: past 1.0, where BM25's
+normalisation is already total, MRR falls monotonically. The peak is real and
+it sits exactly at the boundary of the range that means anything.
+
+### Does it generalise?
+
+| corpus, query shape | B = 0.75 | B = 1.00 |
+|---|---|---|
+| crate sources, 6-word spans | 0.5566 | **0.6438** |
+| crate sources, 3-word spans | 0.3347 | **0.4102** |
+| crate sources, titles | 0.3445 | **0.3780** |
+| rustdoc HTML, 6-word spans † | 0.1514 | 0.1573 |
+| rustdoc HTML, 3-word spans † | 0.0877 | 0.0956 |
+| 41 worktrees of one repository † | 0.0674 | 0.0728 |
+
+† flagged by the duplicate check above, so read only the direction.
+
+Every measurement points the same way and none reverses. But five of the six
+come from corpora the harness itself says are compromised, and the sixth is one
+collection of one genre — source files, whose lengths span three orders of
+magnitude, which is exactly the situation where heavy length normalisation
+should win.
+
+**So the default stays at 0.75.** Not because the evidence is weak — on the one
+clean corpus it is strong — but because "the best `B` for this corpus" is a
+different claim from "the best `B`", and only the second one justifies changing
+what everyone gets. What would change it: the same result on a judged
+collection, where the thing being measured is relevance rather than
+findability.
+
+What the finding does justify is making the knob reachable. Today `K1` and `B`
+are compile-time constants, and they have to be, because block-max bounds are
+computed with them when a segment is written — a bound computed with a
+different formula than the one that scores queries is not a bound, it is a
+source of missing results. Per-corpus tuning means storing the parameters in
+the segment and refusing to merge segments that disagree. That is a format
+change, and it is the honest next step rather than a number quietly moved.
+
 ## What these numbers are not
 
 **Comparable to anyone else's.** Different corpus, different queries, different

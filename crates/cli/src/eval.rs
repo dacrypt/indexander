@@ -14,6 +14,7 @@ use indexander_core::DocId;
 use indexander_eval::metrics::{Judged, Scores, Summary};
 use indexander_eval::qrels::{Qrels, parse_topics};
 use indexander_eval::sampling::{Rng, sample, span};
+use indexander_eval::ties::{Ties, tie_group};
 use indexander_index::query;
 use indexander_index::search::search;
 use indexander_index::segment::Segment;
@@ -123,6 +124,7 @@ pub fn cmd_known_item(args: &[String]) -> Result<(), String> {
     let mut skipped = 0usize;
     let mut missing = 0usize;
     let mut beyond = 0usize;
+    let mut ties = Ties::new();
     let started = std::time::Instant::now();
 
     for i in sample(files.len(), want, seed as u64) {
@@ -146,13 +148,18 @@ pub fn cmd_known_item(args: &[String]) -> Result<(), String> {
         }
         let mut judged = Judged::new();
         judged.judge(&answer, 1);
-        let ranked = run_query(&segment, &question.join(" "), depth)?;
+        let scored = run_scored(&segment, &question.join(" "), depth)?;
+        let ranked: Vec<String> = scored.iter().map(|(uri, _)| uri.clone()).collect();
         // Every term is required and the answer contains all of them, so the
         // answer is in the result set by construction. Not finding it means it
         // ranked below `depth` - a distinct failure from ranking badly inside
         // the top ten, and one a mean over ranks would hide.
-        if !ranked.iter().any(|uri| uri == &answer) {
-            beyond += 1;
+        match ranked.iter().position(|uri| uri == &answer) {
+            Some(at) => {
+                let by_score: Vec<f32> = scored.iter().map(|(_, s)| *s).collect();
+                ties.add(tie_group(&by_score, at));
+            }
+            None => beyond += 1,
         }
         summary.add(Scores::of(&ranked, &judged, k), ranked.len().min(k));
         top.add(Scores::of(&ranked, &judged, 1), ranked.len().min(1));
@@ -166,6 +173,59 @@ pub fn cmd_known_item(args: &[String]) -> Result<(), String> {
             if skipped == 1 { "" } else { "s" }
         ));
     }
+
+    report_known_item(&Run {
+        summary: &summary,
+        top: &top,
+        ties: &ties,
+        from,
+        length,
+        seed,
+        k,
+        depth,
+        documents: segment.document_count(),
+        elapsed,
+        skipped,
+        missing,
+        beyond,
+    });
+    Ok(())
+}
+
+/// Everything one known-item run produced, so the reporting is one function
+/// rather than twenty lines wedged into the end of the command.
+struct Run<'a> {
+    summary: &'a Summary,
+    top: &'a Summary,
+    ties: &'a Ties,
+    from: Source,
+    length: usize,
+    seed: usize,
+    k: usize,
+    depth: usize,
+    documents: usize,
+    elapsed: std::time::Duration,
+    skipped: usize,
+    missing: usize,
+    beyond: usize,
+}
+
+fn report_known_item(run: &Run) {
+    let Run {
+        summary,
+        top,
+        ties,
+        from,
+        length,
+        seed,
+        k,
+        depth,
+        documents,
+        elapsed,
+        skipped,
+        missing,
+        beyond,
+    } = *run;
 
     println!(
         "known-item: {} from the {} of each document, seed {seed}",
@@ -182,7 +242,7 @@ pub fn cmd_known_item(args: &[String]) -> Result<(), String> {
     // document, precision@10 cannot exceed 0.1 whatever the ranker does, and
     // average precision is arithmetically identical to reciprocal rank. Both
     // would be numbers that look like measurements and are not.
-    println!("over {} documents\n", segment.document_count());
+    println!("over {documents} documents\n");
     println!("  MRR                      {:.4}", summary.mrr());
     println!("  nDCG@{k:<19} {:.4}", summary.mean_ndcg());
     println!("  success@1                {:.4}", top.success_rate());
@@ -192,6 +252,23 @@ pub fn cmd_known_item(args: &[String]) -> Result<(), String> {
         summary.failures(),
         plural(summary.failures()),
     );
+
+    if ties.tied() > 0 {
+        println!(
+            "\n{} of them had the answer scoring exactly like {:.1} other documents on \
+             average, up to {}",
+            ties.tied(),
+            ties.mean_group() - 1.0,
+            ties.largest() - 1
+        );
+    }
+    if ties.is_compromised() {
+        println!(
+            "the corpus contains duplicates: these numbers describe how many copies of a\n\
+             document exist, not how well the engine ranks. Deduplicate it, or do not read\n\
+             the figures above."
+        );
+    }
     println!(
         "\n{} quer{} in {elapsed:.2?}{}{}",
         summary.topics(),
@@ -207,7 +284,6 @@ pub fn cmd_known_item(args: &[String]) -> Result<(), String> {
             format!(", {missing} not in the index")
         }
     );
-    Ok(())
 }
 
 /// Where a known-item query comes from.
@@ -237,6 +313,17 @@ fn report(summary: &Summary, k: usize, documents: usize) {
 }
 
 fn run_query(segment: &Segment, text: &str, depth: usize) -> Result<Vec<String>, String> {
+    Ok(run_scored(segment, text, depth)?
+        .into_iter()
+        .map(|(uri, _)| uri)
+        .collect())
+}
+
+/// The run, with the score that put each document where it is.
+///
+/// Metrics never look at scores. Tie detection has to: it is the only way to
+/// tell a document the engine ranked from one it merely happened to list.
+fn run_scored(segment: &Segment, text: &str, depth: usize) -> Result<Vec<(String, f32)>, String> {
     let parsed = query::parse(text);
     if parsed.is_empty() {
         return Ok(Vec::new());
@@ -244,7 +331,7 @@ fn run_query(segment: &Segment, text: &str, depth: usize) -> Result<Vec<String>,
     Ok(search(segment, &parsed, depth)
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|hit| hit.uri)
+        .map(|hit| (hit.uri, hit.score))
         .collect())
 }
 

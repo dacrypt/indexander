@@ -37,7 +37,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 24 µs to 135 µs over 103,257 documents; a four-term query, 155 µs |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.557 MRR on known-item queries, and an ablation showing the number moves when the ranker is broken |
-| Tests | 335, including full crawls and eight-shard queries over real sockets |
+| Tests | 342, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -597,6 +597,20 @@ argument, the corpus, why titles score worse than bodies here through no fault
 of the ranker, and what none of these numbers mean, are in
 [docs/EVALUATION.md](docs/EVALUATION.md).
 
+The harness also refuses to be quiet about a corpus that cannot answer the
+question. Pointed at a directory of forty git worktrees of one repository, it
+reported 0.06 MRR — a number that reads exactly like a bad ranker and actually
+meant the right answer was one of forty identical copies. It now counts answers
+that scored *exactly* like other documents and says so before the figures are
+believed.
+
+Used on the ranker itself, the measurement says `K1` is worth nothing here
+(four values within 0.0006 of each other) and `B` is worth everything: full
+length normalisation beats the textbook 0.75 by 0.087 MRR on this corpus, with
+a real peak rather than a runaway. The default has not been changed on the
+strength of one corpus — [docs/EVALUATION.md](docs/EVALUATION.md) says why, and
+what would change it.
+
 `indexander eval` is the other half, for when somebody has judged a collection:
 TREC topics and qrels in, P@k / nDCG@k / MAP / MRR out. It also prints how many
 returned documents nobody judged, because a run where that number is large is
@@ -624,7 +638,8 @@ crates/crawl   robots.txt, HTML extraction, URL normalisation, frontier, fetch
 crates/rank    the link graph as CSR, and PageRank over it
 crates/proto   the coordinator/shard wire protocol and shard routing
 crates/cluster the coordinator and shard roles, over TCP
-crates/eval    relevance metrics, TREC qrels, and known-item sampling
+crates/eval    relevance metrics, TREC qrels, known-item sampling, and the
+               duplicate check that says when a corpus cannot answer the question
 crates/cli     the `indexander` binary
 ```
 
@@ -645,6 +660,10 @@ Stated plainly, because a README that only lists what works is a sales page:
 - **A judged collection.** Ranking is measured against known-item queries,
   which have one right answer and need no human. What documents are *about* is
   a harder question and needs judgements this repository does not have.
+- **Per-corpus scoring parameters.** `K1` and `B` are compile-time constants
+  because block-max bounds are computed with them at index time. Tuning them
+  per corpus — which the measurements say is worth 0.087 MRR — means storing
+  them in the segment and refusing to merge segments that disagree.
 - **Snippets.** Positions are stored, so highlighted extracts are a query away.
 - **An HTTP API and a UI.** There is a CLI and a library.
 - **A real HTML parser.** `crates/crawl/src/extract.rs` is a scanner, not a

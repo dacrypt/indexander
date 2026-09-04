@@ -23,6 +23,7 @@
 pub mod metrics;
 pub mod qrels;
 pub mod sampling;
+pub mod ties;
 
 pub use metrics::{Judged, Scores};
 pub use qrels::{Qrels, Topic};
