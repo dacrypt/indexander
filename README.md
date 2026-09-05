@@ -39,7 +39,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 18 µs to 63 µs over 7,661 documents, warm; the older 103k-document figures elsewhere in this file were measured under the intersection semantics that bare terms no longer have |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.258 MAP and 0.844 success@10 on Cranfield's human judgements; 0.557 MRR on known-item queries |
-| Tests | 395, including full crawls and eight-shard queries over real sockets |
+| Tests | 398, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -788,6 +788,24 @@ handed-out 3` — three queued, because the one in flight went back — and the
 resumed crawl produces the same eight pages a fresh one does, with no
 duplicates.
 
+A finished checkpoint is not dead weight, which is why nothing deletes it on
+its own. Resuming over one whose queue is empty rebuilds the index from the
+spool and fetches nothing at all — with the server switched off:
+
+```console
+$ indexander crawl --resume --checkpoint ./run --out again.ixdr --b 1.0
+resuming: 8 page(s) already fetched
+fetched 0, indexed 0, 23 terms in 11.03ms
+```
+
+That is how a corpus gets reindexed with different scoring parameters without
+crawling anyone's site a second time, and given that the right `b` is a
+property of the corpus, it is worth having. It is also not free — the spool
+holds all of the text where the index holds a third of it — so the size is
+printed at the end of every crawl, and `--discard-checkpoint` removes it once
+the index is written. Only once: the spool is the only copy of those pages
+until the segment is on disk.
+
 ## Query syntax
 
 ```text
@@ -891,8 +909,6 @@ Stated plainly, because a README that only lists what works is a sales page:
   and it was measured at roughly 4% of tokens, so this is on the list rather
   than urgent. [docs/EVALUATION.md](docs/EVALUATION.md) has the numbers, and
   why a `html5ever`-grade parser was measured and then not written.
-- **Deleting a checkpoint's spool once the index is written.** It is a second
-  copy of every page crawled, and nothing removes it.
 
 ## Lineage
 

@@ -44,6 +44,7 @@ USAGE:
                               [--delay <ms>] [--concurrency <n>] [--any-host]
                               [--k1 <n>] [--b <n>]
                               [--checkpoint <dir>] [--checkpoint-every <n>] [--resume]
+                              [--discard-checkpoint]
     indexander index <directory> [--out <segment>] [--k1 <n>] [--b <n>]
     indexander shard  --listen <addr> [--index <segment>] [--from <addr>]
     indexander leases --listen <addr> [--floor <ms>]     rate limits + robots.txt
@@ -64,6 +65,8 @@ EXAMPLES:
     indexander crawl https://example.com --pages 200 --depth 2
     indexander index ./docs
     indexander index ./docs --b 1.0        # see docs/EVALUATION.md
+    indexander crawl https://example.com --checkpoint ./run --checkpoint-every 50
+    indexander crawl --resume --checkpoint ./run --out index.ixdr
     indexander search motor de busqueda
     indexander search '\"inverted index\"' -perl --limit 5
     indexander shard --listen 127.0.0.1:7801 --index shard0.ixdr
@@ -153,12 +156,17 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     let (every, rest) = take_option(&rest, "--checkpoint-every");
     let (resume, rest): (Vec<String>, Vec<String>) =
         rest.into_iter().partition(|a| a == "--resume");
+    let (discard, rest): (Vec<String>, Vec<String>) =
+        rest.into_iter().partition(|a| a == "--discard-checkpoint");
     let (any_host, seeds): (Vec<String>, Vec<String>) =
         rest.into_iter().partition(|a| a == "--any-host");
 
     let checkpoint = checkpoint.map(PathBuf::from);
     if !resume.is_empty() && checkpoint.is_none() {
         return Err("--resume needs --checkpoint <directory>".to_owned());
+    }
+    if !discard.is_empty() && checkpoint.is_none() {
+        return Err("--discard-checkpoint needs --checkpoint <directory>".to_owned());
     }
     let interval: usize = every
         .as_deref()
@@ -176,17 +184,7 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     if seeds.is_empty() && saved.is_none() {
         return Err(format!("crawl needs at least one url\n\n{USAGE}"));
     }
-    let seeds: Vec<Url> = seeds
-        .iter()
-        .map(|s| {
-            let with_scheme = if s.contains("://") {
-                s.clone()
-            } else {
-                format!("https://{s}")
-            };
-            Url::parse(&with_scheme).map_err(|e| format!("{s}: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
+    let seeds = parse_seeds(&seeds)?;
 
     let config = crawl_config(
         pages.as_deref(),
@@ -247,7 +245,65 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
         println!("{} url(s) failed to fetch", stats.errors);
     }
     println!("{} -> {}", out.display(), human_bytes(size));
+
+    settle_checkpoint(
+        checkpoint.as_deref(),
+        discard.is_empty(),
+        builder.document_count(),
+    );
     Ok(())
+}
+
+/// Turns what was typed into URLs, supplying `https://` when no scheme was.
+///
+/// Defaulting to `https` rather than `http` because a crawler that silently
+/// downgrades is one that quietly reads pages over the wire in clear.
+fn parse_seeds(given: &[String]) -> Result<Vec<Url>, String> {
+    given
+        .iter()
+        .map(|s| {
+            let with_scheme = if s.contains("://") {
+                s.clone()
+            } else {
+                format!("https://{s}")
+            };
+            Url::parse(&with_scheme).map_err(|e| format!("{s}: {e}"))
+        })
+        .collect()
+}
+
+/// Keeps or removes the checkpoint, once the index is on disk.
+///
+/// Called after the segment is written and never before: until then the spool
+/// is the only copy of those pages. An index with no documents means the crawl
+/// produced nothing, and deleting the pages that would let it be retried is
+/// the last thing to do about that.
+///
+/// The count, not the file size. An empty segment is still a hundred bytes of
+/// footer, so a size check reads as success and discards the checkpoint of a
+/// crawl that fetched nothing — which is exactly what it did before this was
+/// tried against a URL that 404s.
+fn settle_checkpoint(directory: Option<&Path>, keep: bool, documents: usize) {
+    let Some(directory) = directory else { return };
+    if keep {
+        if let Ok(meta) = std::fs::metadata(directory.join("SPOOL")) {
+            println!(
+                "checkpoint kept: {} in {} — `crawl --resume` over it reindexes without \
+                 fetching again; --discard-checkpoint removes it",
+                human_bytes(meta.len()),
+                directory.display()
+            );
+        }
+        return;
+    }
+    if documents == 0 {
+        eprintln!("the index holds no documents, so the checkpoint was kept");
+        return;
+    }
+    match Checkpoint::discard(directory) {
+        Ok(freed) => println!("checkpoint discarded, {} freed", human_bytes(freed)),
+        Err(e) => eprintln!("could not discard the checkpoint: {e}"),
+    }
 }
 
 /// What one crawl needs to know, so the function that runs it takes one

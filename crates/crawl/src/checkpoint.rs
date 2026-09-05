@@ -378,6 +378,42 @@ impl Checkpoint {
         Ok(())
     }
 
+    /// Removes a checkpoint, returning how many bytes it freed.
+    ///
+    /// Only ever called once an index has been written, and never by default.
+    /// A finished checkpoint is not dead weight: `crawl --resume` over one
+    /// whose queue is empty rebuilds the index from the spool and fetches
+    /// nothing, which is how a corpus gets reindexed with different scoring
+    /// parameters without crawling anyone's site a second time. Measured on a
+    /// small crawl, the spool was larger than the index it produced — the
+    /// index is a third of the text it indexes and the spool is all of it — so
+    /// this is a real cost, and one an operator should choose to pay rather
+    /// than have chosen for them.
+    ///
+    /// # Errors
+    ///
+    /// If a file exists and cannot be removed. A checkpoint that is already
+    /// gone is not an error: the caller wanted it gone.
+    pub fn discard(directory: &Path) -> Result<u64> {
+        let mut freed = 0u64;
+        for name in [SPOOL, FRONTIER] {
+            let path = directory.join(name);
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    std::fs::remove_file(&path)?;
+                    freed += meta.len();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Only if it is now empty. The directory may be one the operator
+        // chose for other things too, and removing it because we emptied our
+        // corner of it would be a surprise.
+        let _ = std::fs::remove_dir(directory);
+        Ok(freed)
+    }
+
     /// Reads a frontier, or `None` if there is none to read.
     ///
     /// # Errors
@@ -666,6 +702,63 @@ mod tests {
             !dir.join("FRONTIER.writing").exists(),
             "the temporary file was left behind"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discarding_removes_both_files_and_says_what_it_freed() {
+        let dir = scratch("discard");
+        let mut spool = Spool::open(&dir).expect("open");
+        for n in 0..4 {
+            spool.append(&page(n)).expect("append");
+        }
+        spool.flush().expect("flush");
+        drop(spool);
+        Checkpoint {
+            queue: Vec::new(),
+            seen: Vec::new(),
+            anchors: Vec::new(),
+            per_host: Vec::new(),
+            seed_hosts: Vec::new(),
+            handed_out: 4,
+            spooled: 4,
+        }
+        .write_to(&dir)
+        .expect("write");
+
+        let before = std::fs::metadata(dir.join(SPOOL)).expect("spool").len()
+            + std::fs::metadata(dir.join(FRONTIER))
+                .expect("frontier")
+                .len();
+        let freed = Checkpoint::discard(&dir).expect("discard");
+        assert_eq!(freed, before);
+        assert!(!dir.join(SPOOL).exists());
+        assert!(!dir.join(FRONTIER).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discarding_a_checkpoint_that_is_not_there_is_not_an_error() {
+        let dir = scratch("discard-absent");
+        assert_eq!(Checkpoint::discard(&dir).expect("discard"), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discarding_leaves_a_directory_that_holds_other_things() {
+        let dir = scratch("discard-shared");
+        std::fs::write(dir.join("notes.txt"), "not ours").expect("write");
+        let mut spool = Spool::open(&dir).expect("open");
+        spool.append(&page(0)).expect("append");
+        spool.flush().expect("flush");
+        drop(spool);
+
+        Checkpoint::discard(&dir).expect("discard");
+        assert!(
+            dir.exists(),
+            "the directory was removed with a stranger in it"
+        );
+        assert!(dir.join("notes.txt").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
