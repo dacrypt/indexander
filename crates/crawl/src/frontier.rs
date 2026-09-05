@@ -56,6 +56,16 @@ pub struct Frontier {
     anchors: HashMap<String, Vec<String>>,
     per_host: HashMap<String, usize>,
     seed_hosts: HashSet<String>,
+    /// Handed to a worker and not yet accounted for, with the depth it was
+    /// queued at.
+    ///
+    /// A URL leaves the queue the moment a worker takes it and enters `seen`
+    /// when it is first queued, so between those two a crash loses it from
+    /// both: not queued, never to be queued again. That is a page silently
+    /// missing from the index, which is the one failure a checkpoint must not
+    /// have. Anything still in here goes back into the queue when the frontier
+    /// is saved.
+    in_flight: HashMap<String, u32>,
     handed_out: usize,
     limits: Limits,
 }
@@ -66,6 +76,7 @@ impl Frontier {
         Self {
             queue: VecDeque::new(),
             seen: HashSet::new(),
+            in_flight: HashMap::new(),
             anchors: HashMap::new(),
             per_host: HashMap::new(),
             seed_hosts: HashSet::new(),
@@ -135,6 +146,8 @@ impl Frontier {
             }
             *count += 1;
             self.handed_out += 1;
+            self.in_flight
+                .insert(pending.url.to_string(), pending.depth);
             return Some(pending);
         }
         None
@@ -153,6 +166,74 @@ impl Frontier {
     #[must_use]
     pub fn seen_count(&self) -> usize {
         self.seen.len()
+    }
+
+    #[must_use]
+    /// Rebuilds a frontier from its parts. Only [`crate::checkpoint`] calls
+    /// this, and it exists so the fields can stay private everywhere else.
+    pub(crate) fn from_parts(
+        limits: Limits,
+        queue: VecDeque<Pending>,
+        seen: HashSet<String>,
+        anchors: HashMap<String, Vec<String>>,
+        per_host: HashMap<String, usize>,
+        seed_hosts: HashSet<String>,
+        handed_out: usize,
+    ) -> Self {
+        Self {
+            queue,
+            seen,
+            anchors,
+            per_host,
+            seed_hosts,
+            // A restored frontier owes nothing: whatever was in flight when it
+            // was saved is back in the queue.
+            in_flight: HashMap::new(),
+            handed_out,
+            limits,
+        }
+    }
+
+    /// What is waiting to be fetched, in the order it will be handed out.
+    pub(crate) fn pending(&self) -> impl Iterator<Item = &Pending> {
+        self.queue.iter()
+    }
+
+    /// Every URL this crawl has decided it will not queue again.
+    pub(crate) fn seen_urls(&self) -> impl Iterator<Item = &str> {
+        self.seen.iter().map(String::as_str)
+    }
+
+    /// Anchor text still waiting for the page it describes.
+    pub(crate) fn pending_anchors(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.anchors
+            .iter()
+            .map(|(url, texts)| (url.as_str(), texts.as_slice()))
+    }
+
+    pub(crate) fn host_counts(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.per_host.iter().map(|(host, n)| (host.as_str(), *n))
+    }
+
+    pub(crate) fn seed_host_names(&self) -> impl Iterator<Item = &str> {
+        self.seed_hosts.iter().map(String::as_str)
+    }
+
+    /// Marks a URL as accounted for: fetched and written somewhere durable, or
+    /// definitively given up on.
+    ///
+    /// Until this is called the URL is treated as still owed, and a checkpoint
+    /// will put it back in the queue. Calling it for a page that has been
+    /// fetched but not yet spooled is how a resume grows a gap.
+    pub fn completed(&mut self, url: &str) {
+        self.in_flight.remove(url);
+    }
+
+    /// URLs handed out and not yet accounted for, with their depths.
+    pub(crate) fn in_flight(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.in_flight
+            .iter()
+            .map(|(url, depth)| (url.as_str(), *depth))
     }
 
     #[must_use]

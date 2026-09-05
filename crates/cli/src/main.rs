@@ -20,9 +20,10 @@ use indexander_cluster::leases::LeaseAuthority;
 use indexander_cluster::shard::{Replica, ShardIndex};
 use indexander_core::DocId;
 use indexander_core::Document;
-use indexander_crawl::Config;
+use indexander_crawl::checkpoint::{Checkpoint, Spool, read_spool};
 use indexander_crawl::politeness::Politeness;
 use indexander_crawl::robots_cache::RobotsCache;
+use indexander_crawl::{Config, Progress, Stats as CrawlStats};
 use indexander_index::builder::SegmentBuilder;
 use indexander_index::manifest::{Entry as ManifestEntry, Manifest, Policy as MergePolicy};
 use indexander_index::merger::Merger;
@@ -42,6 +43,7 @@ USAGE:
     indexander crawl <url>... [--out <segment>] [--pages <n>] [--depth <n>]
                               [--delay <ms>] [--concurrency <n>] [--any-host]
                               [--k1 <n>] [--b <n>]
+                              [--checkpoint <dir>] [--checkpoint-every <n>] [--resume]
     indexander index <directory> [--out <segment>] [--k1 <n>] [--b <n>]
     indexander shard  --listen <addr> [--index <segment>] [--from <addr>]
     indexander leases --listen <addr> [--floor <ms>]     rate limits + robots.txt
@@ -147,10 +149,31 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     let (delay, rest) = take_option(&rest, "--delay");
     let (concurrency, rest) = take_option(&rest, "--concurrency");
     let (leases, rest) = take_option(&rest, "--leases");
+    let (checkpoint, rest) = take_option(&rest, "--checkpoint");
+    let (every, rest) = take_option(&rest, "--checkpoint-every");
+    let (resume, rest): (Vec<String>, Vec<String>) =
+        rest.into_iter().partition(|a| a == "--resume");
     let (any_host, seeds): (Vec<String>, Vec<String>) =
         rest.into_iter().partition(|a| a == "--any-host");
 
-    if seeds.is_empty() {
+    let checkpoint = checkpoint.map(PathBuf::from);
+    if !resume.is_empty() && checkpoint.is_none() {
+        return Err("--resume needs --checkpoint <directory>".to_owned());
+    }
+    let interval: usize = every
+        .as_deref()
+        .map_or(Ok(50), str::parse)
+        .map_err(|_| "--checkpoint-every needs a number of pages".to_owned())?;
+
+    // Resuming supplies its own frontier, so seeds are only required when
+    // there is nothing to pick up from.
+    let saved = match &checkpoint {
+        Some(dir) if !resume.is_empty() => {
+            Checkpoint::open(dir).map_err(|e| format!("reading the checkpoint: {e}"))?
+        }
+        _ => None,
+    };
+    if seeds.is_empty() && saved.is_none() {
         return Err(format!("crawl needs at least one url\n\n{USAGE}"));
     }
     let seeds: Vec<Url> = seeds
@@ -187,28 +210,15 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     // The index is built as pages arrive, but PageRank cannot be: it needs the
     // whole graph. So the crawl builds both, and the ranks are applied at the
     // end, before the segment is written.
-    let (mut builder, graph_builder, stats) = runtime.block_on(async {
-        let (politeness, robots) = shared_or_local(leases.as_deref(), config.delay).await?;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let crawling = indexander_crawl::crawl_sharing(&config, &seeds, tx, politeness, robots);
-        let indexing = async {
-            let mut builder = SegmentBuilder::with_params(params);
-            let mut graph = GraphBuilder::new();
-            while let Some(doc) = rx.recv().await {
-                if builder.document_count() % 25 == 0 && builder.document_count() > 0 {
-                    println!("  {} pages...", builder.document_count());
-                }
-                graph.node(&doc.uri);
-                for link in &doc.links {
-                    graph.edge(&doc.uri, link);
-                }
-                builder.add(&doc);
-            }
-            (builder, graph)
-        };
-        let (stats, (builder, graph)) = tokio::join!(crawling, indexing);
-        stats.map(|s| (builder, graph, s))
-    })?;
+    let (mut builder, graph_builder, stats) = runtime.block_on(gather(Run {
+        config: &config,
+        seeds: &seeds,
+        params,
+        leases: leases.as_deref(),
+        checkpoint: checkpoint.as_deref(),
+        saved: saved.as_ref(),
+        interval,
+    }))?;
 
     apply_pagerank(&mut builder, graph_builder)?;
 
@@ -238,6 +248,110 @@ fn cmd_crawl(args: &[String]) -> Result<(), String> {
     }
     println!("{} -> {}", out.display(), human_bytes(size));
     Ok(())
+}
+
+/// What one crawl needs to know, so the function that runs it takes one
+/// argument instead of seven.
+struct Run<'a> {
+    config: &'a Config,
+    seeds: &'a [Url],
+    params: Params,
+    leases: Option<&'a str>,
+    checkpoint: Option<&'a Path>,
+    saved: Option<&'a Checkpoint>,
+    interval: usize,
+}
+
+/// Fetches, indexes and checkpoints, returning what `PageRank` needs.
+///
+/// Separated from argument parsing because it is a different job, and because
+/// the two together were long enough that the interesting part - the order of
+/// spool, flush, frontier - was buried in the middle of option handling.
+async fn gather(run: Run<'_>) -> Result<(SegmentBuilder, GraphBuilder, CrawlStats), String> {
+    let (politeness, robots) = shared_or_local(run.leases, run.config.delay).await?;
+    let progress = match run.saved {
+        Some(state) => Progress::resuming(run.config, state)?,
+        None => Progress::starting(run.config, run.seeds),
+    };
+
+    let mut builder = SegmentBuilder::with_params(run.params);
+    let mut graph = GraphBuilder::new();
+    let mut spool = match run.checkpoint {
+        Some(dir) => Some(Spool::open(dir).map_err(|e| format!("opening the spool: {e}"))?),
+        None => None,
+    };
+
+    // Everything fetched before the last run stopped, replayed into the index.
+    // Not re-fetched: that is the whole point.
+    if let (Some(dir), Some(state)) = (run.checkpoint, run.saved) {
+        let earlier = read_spool(dir, state.spooled)
+            .map_err(|e| format!("reading the spooled pages: {e}"))?;
+        println!("resuming: {} page(s) already fetched", earlier.len());
+        for doc in &earlier {
+            index_one(&mut builder, &mut graph, doc);
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let crawling = indexander_crawl::crawl_prepared(&progress, run.config, tx, politeness, robots);
+    let indexing = async {
+        let mut since = 0usize;
+        while let Some(doc) = rx.recv().await {
+            if builder.document_count() % 25 == 0 && builder.document_count() > 0 {
+                println!("  {} pages...", builder.document_count());
+            }
+            index_one(&mut builder, &mut graph, &doc);
+            if let Some(spool) = spool.as_mut() {
+                // Spooled before any checkpoint. The frontier is about to
+                // claim this page exists; it had better be on the disk and not
+                // in a buffer.
+                if let Err(e) = spool.append(&doc) {
+                    eprintln!("could not spool {}: {e}", doc.uri);
+                }
+                // Only now is the page no longer owed. Saying so earlier would
+                // let a checkpoint drop it; saying so later would only mean
+                // fetching it twice.
+                progress.completed(&doc.uri).await;
+                since += 1;
+                if since >= run.interval {
+                    since = 0;
+                    save(spool, &progress, run.checkpoint).await;
+                }
+            }
+        }
+        if let Some(spool) = spool.as_mut() {
+            save(spool, &progress, run.checkpoint).await;
+        }
+        (builder, graph)
+    };
+    let (stats, (builder, graph)) = tokio::join!(crawling, indexing);
+    stats.map(|s| (builder, graph, s))
+}
+
+/// Adds one fetched page to the index and to the link graph.
+fn index_one(builder: &mut SegmentBuilder, graph: &mut GraphBuilder, doc: &Document) {
+    graph.node(&doc.uri);
+    for link in &doc.links {
+        graph.edge(&doc.uri, link);
+    }
+    builder.add(doc);
+}
+
+/// Flushes the spool and writes the frontier beside it, in that order.
+///
+/// A checkpoint that fails is reported and does not stop the crawl: the pages
+/// already fetched are still going into the index, and losing the ability to
+/// resume is not a reason to throw away the run in progress.
+async fn save(spool: &mut Spool, progress: &Progress, directory: Option<&Path>) {
+    let Some(directory) = directory else { return };
+    if let Err(e) = spool.flush() {
+        eprintln!("could not flush the spool: {e}");
+        return;
+    }
+    let state = progress.checkpoint(spool.appended()).await;
+    if let Err(e) = state.write_to(directory) {
+        eprintln!("could not write the frontier: {e}");
+    }
 }
 
 /// Computes PageRank over the crawled graph and writes each score into the

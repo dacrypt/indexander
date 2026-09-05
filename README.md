@@ -39,7 +39,7 @@ language and the ranking are real and tested end to end.
 | Query latency | 18 µs to 63 µs over 7,661 documents, warm; the older 103k-document figures elsewhere in this file were measured under the intersection semantics that bare terms no longer have |
 | Ranking | BM25 for relevance, PageRank for authority, combined multiplicatively |
 | Result quality | 0.258 MAP and 0.844 success@10 on Cranfield's human judgements; 0.557 MRR on known-item queries |
-| Tests | 384, including full crawls and eight-shard queries over real sockets |
+| Tests | 395, including full crawls and eight-shard queries over real sockets |
 | Memory | 7.7 MB resident to serve a 248 MB index |
 | `unsafe` | one block, in `Segment::open`, to memory map a file |
 | Dependencies | `core` and `index` have none outside `std`; the crawler needs `tokio`, `reqwest` and `url` |
@@ -751,6 +751,43 @@ A refresh that fails changes nothing. Segments arrive before the manifest and
 the index is reopened only after both, so a replica whose source died mid-sync
 goes on serving exactly what it was serving.
 
+### A crawl that survives being killed
+
+```console
+$ indexander crawl https://example.com --checkpoint ./run --checkpoint-every 50
+  ... killed after four hours ...
+
+$ indexander crawl --resume --checkpoint ./run --out index.ixdr
+resuming: 2450 page(s) already fetched
+fetched 610, indexed 610, ...
+```
+
+What is checkpointed is the *pages*, not the index. It cannot be the index:
+every document's authority comes from `PageRank` over the whole link graph, and
+that graph is not finished until the crawl is — so a half-written index would
+hold ranks computed from half a web. The pages go to an append-only spool, the
+index is built at the end exactly as it always was.
+
+Two files, written separately, and a crash can land between them. Frontier
+first loses pages it already calls seen: gaps, silent and permanent. Pages
+first re-fetches them, and they are already spooled, so the index gets each of
+them twice. Neither is acceptable, so **the frontier records how many spooled
+pages it accounts for** and a resume reads exactly that many. Anything written
+after the last save is ignored and comes back through the queue.
+
+That was still not enough, and the first run against a real site is what said
+so: a resumed crawl came back with seven pages where a fresh one found eight. A
+URL leaves the queue the moment a worker takes it, and enters `seen` when it is
+first *queued* — so a crash in between loses it from both. Not waiting, and
+never to be queued again. A checkpoint now puts everything still in flight back
+in the queue, and `a_page_handed_out_but_never_written_comes_back` is the test
+that keeps it there.
+
+Killed after two pages of an eight-page crawl, the checkpoint reads `spooled 2,
+handed-out 3` — three queued, because the one in flight went back — and the
+resumed crawl produces the same eight pages a fresh one does, with no
+duplicates.
+
 ## Query syntax
 
 ```text
@@ -854,8 +891,8 @@ Stated plainly, because a README that only lists what works is a sales page:
   and it was measured at roughly 4% of tokens, so this is on the list rather
   than urgent. [docs/EVALUATION.md](docs/EVALUATION.md) has the numbers, and
   why a `html5ever`-grade parser was measured and then not written.
-- **Crawl state that survives a restart.** The frontier is in memory, so a
-  crawl that stops starts over.
+- **Deleting a checkpoint's spool once the index is written.** It is a second
+  copy of every page crawled, and nothing removes it.
 
 ## Lineage
 

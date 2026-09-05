@@ -15,6 +15,7 @@
 //! Concurrency is across hosts, not within them: several workers run at once,
 //! but each waits its turn per host.
 
+pub mod checkpoint;
 pub mod extract;
 pub mod frontier;
 pub mod normalize;
@@ -30,6 +31,7 @@ use indexander_core::Document;
 use tokio::sync::{Mutex, mpsc};
 use url::Url;
 
+use crate::checkpoint::Checkpoint;
 use crate::frontier::{Frontier, Limits};
 use crate::normalize::{host_of, resolve};
 use crate::politeness::{Politeness, wait_for};
@@ -141,23 +143,101 @@ pub async fn crawl_sharing(
     politeness: Arc<Politeness>,
     robots_cache: Arc<RobotsCache>,
 ) -> Result<Stats, String> {
+    let progress = Progress::starting(config, seeds);
+    crawl_prepared(&progress, config, sink, politeness, robots_cache).await
+}
+
+/// A crawl in progress, held by whoever started it.
+///
+/// It exists so a caller can take a checkpoint mid-crawl. The frontier lives
+/// behind the same lock the workers use, so a snapshot is a consistent view
+/// rather than a torn one — taken while every worker is between pages, which
+/// costs a pause of microseconds and is the difference between a resumable
+/// crawl and a plausible one.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl Progress {
+    /// A fresh crawl from these seeds.
+    #[must_use]
+    pub fn starting(config: &Config, seeds: &[Url]) -> Self {
+        let mut frontier = Frontier::new(config.limits.clone());
+        for seed in seeds {
+            frontier.seed(seed.clone());
+        }
+        Self::around(frontier)
+    }
+
+    /// A crawl picking up from a saved frontier.
+    ///
+    /// Seeds are not re-added: they are in the saved queue if they were still
+    /// waiting, and in `seen` if they were not.
+    ///
+    /// # Errors
+    ///
+    /// If the checkpoint holds a URL that will not parse.
+    pub fn resuming(config: &Config, saved: &Checkpoint) -> Result<Self, String> {
+        let frontier = Frontier::restore(config.limits.clone(), saved)
+            .map_err(|e| format!("restoring the frontier: {e}"))?;
+        Ok(Self::around(frontier))
+    }
+
+    fn around(frontier: Frontier) -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(Shared {
+                frontier,
+                robots: HashMap::new(),
+                stats: Stats::default(),
+            })),
+        }
+    }
+
+    /// A snapshot of the frontier, claiming `spooled` pages already written.
+    ///
+    /// The number matters: see [`crate::checkpoint`]. Flush the spool before
+    /// calling this, or the frontier will promise pages that are still in a
+    /// buffer.
+    pub async fn checkpoint(&self, spooled: usize) -> Checkpoint {
+        self.shared.lock().await.frontier.checkpoint(spooled)
+    }
+
+    /// Says a page is safely written and no longer owed.
+    ///
+    /// Call it after the page is on disk, not when it arrives: a checkpoint
+    /// taken in between must still consider the page outstanding, or a crash
+    /// loses it from both the queue and the future.
+    pub async fn completed(&self, uri: &str) {
+        self.shared.lock().await.frontier.completed(uri);
+    }
+
+    /// How many pages have been handed out to workers so far.
+    pub async fn handed_out(&self) -> usize {
+        self.shared.lock().await.frontier.handed_out()
+    }
+}
+
+/// Runs a crawl against a frontier the caller is holding.
+///
+/// # Errors
+///
+/// Never returns `Err` from the crawl itself — a page that fails is counted,
+/// not fatal. The signature keeps the shape of its callers.
+pub async fn crawl_prepared(
+    progress: &Progress,
+    config: &Config,
+    sink: mpsc::Sender<Document>,
+    politeness: Arc<Politeness>,
+    robots_cache: Arc<RobotsCache>,
+) -> Result<Stats, String> {
     let client = reqwest::Client::builder()
         .user_agent(config.user_agent.clone())
         .timeout(config.timeout)
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|e| format!("building http client: {e}"))?;
-
-    let mut frontier = Frontier::new(config.limits.clone());
-    for seed in seeds {
-        frontier.seed(seed.clone());
-    }
-
-    let shared = Arc::new(Mutex::new(Shared {
-        frontier,
-        robots: HashMap::new(),
-        stats: Stats::default(),
-    }));
+    let shared = Arc::clone(&progress.shared);
 
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..config.concurrency.max(1) {
